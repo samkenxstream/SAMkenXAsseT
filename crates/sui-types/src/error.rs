@@ -5,6 +5,9 @@
 use crate::{
     base_types::*,
     committee::{Committee, EpochId, StakeUnit},
+    digests::CheckpointContentsDigest,
+    execution_status::CommandArgumentError,
+    messages_checkpoint::CheckpointSequenceNumber,
     object::Owner,
 };
 
@@ -50,6 +53,32 @@ macro_rules! exit_main {
             }
         }
     };
+}
+
+#[macro_export]
+macro_rules! make_invariant_violation {
+    ($($args:expr),* $(,)?) => {{
+        if cfg!(debug_assertions) {
+            panic!($($args),*)
+        }
+        ExecutionError::invariant_violation(format!($($args),*))
+    }}
+}
+
+#[macro_export]
+macro_rules! invariant_violation {
+    ($($args:expr),* $(,)?) => {
+        return Err(make_invariant_violation!($($args),*).into())
+    };
+}
+
+#[macro_export]
+macro_rules! assert_invariant {
+    ($cond:expr, $($args:expr),* $(,)?) => {{
+        if !$cond {
+            invariant_violation!($($args),*)
+        }
+    }};
 }
 
 #[derive(
@@ -180,11 +209,29 @@ pub enum UserInputError {
     #[error("Transaction is denied: {}", error)]
     TransactionDenied { error: String },
 
-    #[error("Feature is not yet supported: {0}")]
+    #[error("Feature is not supported: {0}")]
     Unsupported(String),
 
     #[error("Query transactions with move function input error: {0}")]
     MoveFunctionInputError(String),
+
+    #[error("Verified checkpoint not found for sequence number: {0}")]
+    VerifiedCheckpointNotFound(CheckpointSequenceNumber),
+
+    #[error("Verified checkpoint not found for digest: {0}")]
+    VerifiedCheckpointDigestNotFound(String),
+
+    #[error("Latest checkpoint sequence number not found")]
+    LatestCheckpointSequenceNumberNotFound,
+
+    #[error("Checkpoint contents not found for digest: {0}")]
+    CheckpointContentsNotFound(CheckpointContentsDigest),
+
+    #[error("Genesis transaction not found")]
+    GenesisTransactionNotFound,
+
+    #[error("Transaction {0} not found")]
+    TransactionCursorNotFound(u64),
 }
 
 #[derive(
@@ -366,6 +413,8 @@ pub enum SuiError {
     TransactionAlreadyExecuted { digest: TransactionDigest },
     #[error("Object ID did not have the expected type")]
     BadObjectType { error: String },
+    #[error("Fail to retrieve Object layout for {st}")]
+    FailObjectLayout { st: String },
 
     #[error("Execution invariant violated")]
     ExecutionInvariantViolation,
@@ -396,8 +445,8 @@ pub enum SuiError {
     #[error("Authority Error: {error:?}")]
     GenericAuthorityError { error: String },
 
-    #[error("Failed to dispatch event: {error:?}")]
-    EventFailedToDispatch { error: String },
+    #[error("Failed to dispatch subscription: {error:?}")]
+    FailedToDispatchSubscription { error: String },
 
     #[error("Failed to serialize Owner: {error:?}")]
     OwnerFailedToSerialize { error: String },
@@ -505,6 +554,9 @@ pub enum SuiError {
 
     #[error("Failed to perform file operation: {0}")]
     FileIOError(String),
+
+    #[error("Failed to get JWK")]
+    JWKRetrievalError,
 }
 
 #[repr(u64)]
@@ -688,6 +740,18 @@ impl SuiError {
     }
 }
 
+impl Ord for SuiError {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        Ord::cmp(self.as_ref(), other.as_ref())
+    }
+}
+
+impl PartialOrd for SuiError {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub type ExecutionErrorKind = ExecutionFailureStatus;
@@ -765,4 +829,11 @@ impl From<ExecutionErrorKind> for ExecutionError {
     fn from(kind: ExecutionErrorKind) -> Self {
         Self::from_kind(kind)
     }
+}
+
+pub fn command_argument_error(e: CommandArgumentError, arg_idx: usize) -> ExecutionError {
+    ExecutionError::from_kind(ExecutionErrorKind::command_argument_error(
+        e,
+        arg_idx as u16,
+    ))
 }

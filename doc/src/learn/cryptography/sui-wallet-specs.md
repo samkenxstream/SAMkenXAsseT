@@ -2,7 +2,7 @@
 title: Sui Wallet Specifications - Keys and Addresses
 ---
 
-Sui Wallet adheres to widely accepted wallet specifications in the cryptocurrency industry, including [BIP-32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki) (and its variation, [SLIP-0010](https://github.com/satoshilabs/slips/blob/master/slip-0010.md)) and its variation [SLIP-0010](https://github.com/satoshilabs/slips/blob/master/slip-0010.md), [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki), and [BIP-39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki), to facilitate key management for users. At present, Sui supports pure Ed25519, ECDSA Secp256k1, ECDSA Secp256r1, and [MultiSig](sui-multisig.md) for signed transactions.
+Sui Wallet adheres to widely accepted wallet specifications in the cryptocurrency industry, including [BIP-32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki) and its variation [SLIP-0010](https://github.com/satoshilabs/slips/blob/master/slip-0010.md), [BIP-44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki), and [BIP-39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki), to facilitate key management for users. At present, Sui supports pure Ed25519, ECDSA Secp256k1, ECDSA Secp256r1, and [MultiSig](sui-multisig.md) for signed transactions.
 
 
 ## Key Derivation Scheme
@@ -54,9 +54,13 @@ const keypair = Ed25519Keypair.deriveKeypair(
 const address = keypair.getPublicKey().toSuiAddress();
 ```
 
-In CLI: 
+You can use the CLI to import a mnemonic or a private key from the wallet:
 ```bash
-sui keytool import "TEST_MNEMONIC" ed25519 "m/44'/784'/0'/0'/0'"
+# imports an account using this mnemonic, the ed25519 signature scheme, and (an optional) derivation path
+sui keytool import "TEST_MNEMONIC" ed25519 "m/44'/784'/0'/0'/0'" 
+# imports an account using the given private key and the ed25519 signature scheme
+sui keytool import "private_key" ed25519
+# creates a new address using the ed25519 signature scheme and (an optional) derivation path
 sui client new-address ed25519 "m/44'/784'/0'/0'/0'"
 ```
 

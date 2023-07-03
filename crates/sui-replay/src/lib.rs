@@ -3,29 +3,60 @@
 
 use async_recursion::async_recursion;
 use clap::Parser;
+use config::ReplayableNetworkConfigSet;
+use fuzz::ReplayFuzzer;
+use fuzz::ReplayFuzzerConfig;
+use fuzz_mutations::base_fuzzers;
+use sui_types::message_envelope::Message;
+use tracing::warn;
+use transaction_provider::{FuzzStartPoint, TransactionSource};
 
 use crate::replay::LocalExec;
 use crate::replay::ProtocolVersionSummary;
+use std::path::PathBuf;
 use std::str::FromStr;
 use sui_config::node::ExpensiveSafetyCheckConfig;
 use sui_types::digests::TransactionDigest;
 use tracing::{error, info};
+pub mod config;
 mod data_fetcher;
 mod db_rider;
+pub mod fuzz;
+pub mod fuzz_mutations;
 mod replay;
-mod types;
+pub mod transaction_provider;
+pub mod types;
 
 #[derive(Parser, Clone)]
 #[clap(rename_all = "kebab-case")]
 pub enum ReplayToolCommand {
+    /// Generate a new network config file
+    #[clap(name = "gen")]
+    GenerateDefaultConfig,
+
+    /// Replay transaction
     #[clap(name = "tx")]
     ReplayTransaction {
         #[clap(long, short)]
         tx_digest: String,
         #[clap(long, short)]
         show_effects: bool,
+        #[clap(long, short)]
+        diag: bool,
+        #[clap(long, short, allow_hyphen_values = true)]
+        executor_version_override: Option<i64>,
     },
 
+    /// Replay a transaction from a node state dump
+    #[clap(name = "rd")]
+    ReplayDump {
+        #[clap(long, short)]
+        path: String,
+        #[clap(long, short)]
+        show_effects: bool,
+    },
+
+    /// Replay all transactions in a range of checkpoints
     #[clap(name = "ch")]
     ReplayCheckpoints {
         #[clap(long, short)]
@@ -38,6 +69,7 @@ pub enum ReplayToolCommand {
         max_tasks: u64,
     },
 
+    /// Replay all transactions in an epoch
     #[clap(name = "ep")]
     ReplayEpoch {
         #[clap(long, short)]
@@ -48,49 +80,115 @@ pub enum ReplayToolCommand {
         max_tasks: u64,
     },
 
+    /// Run the replay based fuzzer
+    #[clap(name = "fz")]
+    Fuzz {
+        #[clap(long, short)]
+        start: Option<FuzzStartPoint>,
+        #[clap(long, short)]
+        num_mutations_per_base: u64,
+        #[clap(long, short = 'b', default_value = "18446744073709551614")]
+        num_base_transactions: u64,
+    },
+
     #[clap(name = "report")]
     Report,
 }
 
 #[async_recursion]
 pub async fn execute_replay_command(
-    rpc_url: String,
+    rpc_url: Option<String>,
     safety_checks: bool,
     use_authority: bool,
+    cfg_path: Option<PathBuf>,
     cmd: ReplayToolCommand,
-) -> anyhow::Result<(u64, u64)> {
+) -> anyhow::Result<Option<(u64, u64)>> {
     let safety = if safety_checks {
         ExpensiveSafetyCheckConfig::new_enable_all()
     } else {
         ExpensiveSafetyCheckConfig::default()
     };
     Ok(match cmd {
+        ReplayToolCommand::GenerateDefaultConfig => {
+            let set = ReplayableNetworkConfigSet::default();
+            let path = set.save_config(None).unwrap();
+            println!("Default config saved to: {}", path.to_str().unwrap());
+            warn!("Note: default config nodes might prune epochs/objects");
+            None
+        }
+        ReplayToolCommand::Fuzz {
+            start,
+            num_mutations_per_base,
+            num_base_transactions,
+        } => {
+            let config = ReplayFuzzerConfig {
+                num_mutations_per_base,
+                mutator: Box::new(base_fuzzers(num_mutations_per_base)),
+                tx_source: TransactionSource::TailLatest { start },
+                fail_over_on_err: false,
+                expensive_safety_check_config: Default::default(),
+            };
+            let fuzzer = ReplayFuzzer::new(rpc_url.expect("Url must be provided"), config)
+                .await
+                .unwrap();
+            fuzzer.run(num_base_transactions).await.unwrap();
+            None
+        }
+        ReplayToolCommand::ReplayDump { path, show_effects } => {
+            let mut lx = LocalExec::new_for_state_dump(&path, rpc_url).await?;
+            let (sandbox_state, node_dump_state) = lx.execute_state_dump(safety).await?;
+            if show_effects {
+                println!("{:#?}", sandbox_state.local_exec_effects);
+            }
+
+            sandbox_state.check_effects()?;
+
+            let effects = node_dump_state.computed_effects.digest();
+            if effects != node_dump_state.expected_effects_digest {
+                error!(
+                    "Effects digest mismatch for {}: expected: {:?}, got: {:?}",
+                    node_dump_state.tx_digest, node_dump_state.expected_effects_digest, effects,
+                );
+                anyhow::bail!("Effects mismatch");
+            }
+
+            info!("Execution finished successfully. Local and on-chain effects match.");
+            Some((1u64, 1u64))
+        }
         ReplayToolCommand::ReplayTransaction {
             tx_digest,
             show_effects,
+            diag,
+            executor_version_override,
         } => {
             let tx_digest = TransactionDigest::from_str(&tx_digest)?;
             info!("Executing tx: {}", tx_digest);
-            let sandbox_state = LocalExec::new_from_fn_url(&rpc_url)
-                .await?
-                .init_for_execution()
-                .await?
-                .execute_transaction(&tx_digest, safety, use_authority)
-                .await?;
+            let sandbox_state = LocalExec::replay_with_network_config(
+                rpc_url,
+                cfg_path.map(|p| p.to_str().unwrap().to_string()),
+                tx_digest,
+                safety,
+                use_authority,
+                executor_version_override,
+            )
+            .await?;
 
-            let effects = sandbox_state.local_exec_effects.clone();
+            if diag {
+                println!("{:#?}", sandbox_state.pre_exec_diag);
+            }
             if show_effects {
-                println!("{:#?}", effects)
+                println!("{:#?}", sandbox_state.local_exec_effects);
             }
 
             sandbox_state.check_effects()?;
 
             info!("Execution finished successfully. Local and on-chain effects match.");
-            (1u64, 1u64)
+            Some((1u64, 1u64))
         }
 
         ReplayToolCommand::Report => {
-            let mut lx = LocalExec::new_from_fn_url(&rpc_url).await?;
+            let mut lx =
+                LocalExec::new_from_fn_url(&rpc_url.expect("Url must be provided")).await?;
             let epoch_table = lx.protocol_ver_to_epoch_map().await?;
 
             // We need this for other activities in this session
@@ -129,7 +227,7 @@ pub async fn execute_replay_command(
                     println!("Package: {} Seq: {}", package_id, seq_num);
                 }
             }
-            (0u64, 0u64)
+            None
         }
 
         ReplayToolCommand::ReplayCheckpoints {
@@ -155,7 +253,7 @@ pub async fn execute_replay_command(
                 handles.push(tokio::spawn(async move {
                     info!("Spawning task {task_count} for checkpoints {checkpoints:?}");
                     let time = std::time::Instant::now();
-                    let (succeeded, total) = LocalExec::new_from_fn_url(&rpc_url)
+                    let (succeeded, total) = LocalExec::new_from_fn_url(&rpc_url.expect("Url must be provided"))
                         .await
                         .unwrap()
                         .init_for_execution()
@@ -197,14 +295,15 @@ pub async fn execute_replay_command(
                 total_time_ms,
                 (total_tx as f64) / (total_time_ms as f64 / 1000.0)
             );
-            (total_succeeded, total_tx)
+            Some((total_succeeded, total_tx))
         }
         ReplayToolCommand::ReplayEpoch {
             epoch,
             terminate_early,
             max_tasks,
         } => {
-            let lx = LocalExec::new_from_fn_url(&rpc_url).await?;
+            let lx =
+                LocalExec::new_from_fn_url(&rpc_url.clone().expect("Url must be provided")).await?;
 
             let (start, end) = lx.checkpoints_for_epoch(epoch).await?;
 
@@ -216,6 +315,7 @@ pub async fn execute_replay_command(
                 rpc_url,
                 safety_checks,
                 use_authority,
+                cfg_path,
                 ReplayToolCommand::ReplayCheckpoints {
                     start,
                     end,
@@ -225,13 +325,16 @@ pub async fn execute_replay_command(
             )
             .await;
             match status {
-                Ok((succeeded, total)) => {
+                Ok(Some((succeeded, total))) => {
                     info!(
                         "Epoch {} replay finished {} out of {} TXs",
                         epoch, succeeded, total
                     );
 
-                    return Ok((succeeded, total));
+                    return Ok(Some((succeeded, total)));
+                }
+                Ok(None) => {
+                    return Ok(None);
                 }
                 Err(e) => {
                     error!("Epoch {} replay failed: {:?}", epoch, e);

@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-    getExecutionStatusError,
-    getExecutionStatusType,
-    getTransactionDigest,
-    getTransactionKind,
-    getTransactionKindName,
-    type SuiTransactionBlockResponse,
+	getExecutionStatusError,
+	getExecutionStatusType,
+	getTransactionDigest,
+	getTransactionKind,
+	getTransactionKindName,
+	type SuiTransactionBlockResponse,
 } from '@mysten/sui.js';
 import clsx from 'clsx';
 
@@ -17,136 +17,97 @@ import clsx from 'clsx';
 // } from '../../components/events/eventDisplay';
 
 import { Signatures } from './Signatures';
-
-import styles from './TransactionResult.module.css';
-
+import { ErrorBoundary } from '~/components/error-boundary/ErrorBoundary';
 import { useBreakpoint } from '~/hooks/useBreakpoint';
+import { Events } from '~/pages/transaction-result/Events';
 import { TransactionData } from '~/pages/transaction-result/TransactionData';
 import { TransactionSummary } from '~/pages/transaction-result/transaction-summary';
 import { Banner } from '~/ui/Banner';
 import { PageHeader } from '~/ui/PageHeader';
 import { SplitPanes } from '~/ui/SplitPanes';
-import { Tab, TabGroup, TabList, TabPanel, TabPanels } from '~/ui/Tabs';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '~/ui/Tabs';
 
-export function TransactionView({
-    transaction,
-}: {
-    transaction: SuiTransactionBlockResponse;
-}) {
-    const isMediumOrAbove = useBreakpoint('md');
+import styles from './TransactionResult.module.css';
 
-    // const txKindData = formatByTransactionKind(txKindName, txnDetails, sender);
-    // const txEventData = transaction.events?.map(eventToDisplay);
+export function TransactionView({ transaction }: { transaction: SuiTransactionBlockResponse }) {
+	const isMediumOrAbove = useBreakpoint('md');
 
-    // MUSTFIX(chris): re-enable event display
-    // let eventTitles: [string, string][] = [];
-    // const txEventDisplay = txEventData?.map((ed, index) => {
-    //     if (!ed) return <div />;
+	const hasEvents = !!transaction.events?.length;
 
-    //     let key = ed.top.title + index;
-    //     eventTitles.push([ed.top.title, key]);
-    //     return (
-    //         <div className={styles.txgridcomponent} key={key}>
-    //             <ItemView data={ed.top as TxItemView} />
-    //             {ed.fields && <ItemView data={ed.fields as TxItemView} />}
-    //         </div>
-    //     );
-    // });
+	const txError = getExecutionStatusError(transaction);
 
-    // let eventTitlesDisplay = eventTitles.map(([title, key]) => (
-    //     <div key={key} className={styles.eventtitle}>
-    //         {title}
-    //     </div>
-    // ));
+	const transactionKindName = getTransactionKindName(getTransactionKind(transaction)!);
 
-    // MUSTFIX(chris): re-enable event display
-    // const hasEvents = txEventData && txEventData.length > 0;
-    const hasEvents = false;
+	const isProgrammableTransaction = transactionKindName === 'ProgrammableTransaction';
 
-    const txError = getExecutionStatusError(transaction);
+	const leftPane = {
+		panel: (
+			<div className="h-full overflow-y-auto rounded-2xl border border-transparent bg-gray-40 p-6 md:h-full md:max-h-screen md:p-10">
+				<Tabs size="lg" defaultValue="summary">
+					<TabsList>
+						<TabsTrigger value="summary">Summary</TabsTrigger>
+						{hasEvents && <TabsTrigger value="events">Events</TabsTrigger>}
+						{isProgrammableTransaction && <TabsTrigger value="signatures">Signatures</TabsTrigger>}
+					</TabsList>
+					<TabsContent value="summary">
+						<div className="mt-10">
+							<TransactionSummary transaction={transaction} />
+						</div>
+					</TabsContent>
+					{hasEvents && (
+						<TabsContent value="events">
+							<div className="mt-10">
+								<Events events={transaction.events!} />
+							</div>
+						</TabsContent>
+					)}
+					<TabsContent value="signatures">
+						<div className="mt-10">
+							<ErrorBoundary>
+								<Signatures transaction={transaction} />
+							</ErrorBoundary>
+						</div>
+					</TabsContent>
+				</Tabs>
+			</div>
+		),
+		minSize: 35,
+		collapsible: true,
+		collapsibleButton: true,
+		noHoverHidden: isMediumOrAbove,
+	};
 
-    const transactionKindName = getTransactionKindName(
-        getTransactionKind(transaction)!
-    );
+	const rightPane = {
+		panel: (
+			<div className="h-full w-full overflow-y-auto md:overflow-y-hidden">
+				<TransactionData transaction={transaction} />
+			</div>
+		),
+		minSize: 40,
+		defaultSize: isProgrammableTransaction ? 65 : 50,
+	};
 
-    const isProgrammableTransaction =
-        transactionKindName === 'ProgrammableTransaction';
-
-    const leftPane = {
-        panel: (
-            <div className="h-full overflow-y-scroll rounded-2xl border border-transparent bg-gray-40 p-6 md:h-screen md:p-10">
-                <TabGroup size="lg">
-                    <TabList>
-                        <Tab>Summary</Tab>
-                        {hasEvents && <Tab>Events</Tab>}
-                        {isProgrammableTransaction && <Tab>Signatures</Tab>}
-                    </TabList>
-                    <TabPanels>
-                        <TabPanel>
-                            <div className="mt-10">
-                                <TransactionSummary transaction={transaction} />
-                            </div>
-                        </TabPanel>
-                        {/* {hasEvents && (
-                        <TabPanel>
-                            <div className={styles.txevents}>
-                                <div className={styles.txeventsleft}>
-                                    {eventTitlesDisplay}
-                                </div>
-                                <div className={styles.txeventsright}>
-                                    {txEventDisplay}
-                                </div>
-                            </div>
-                        </TabPanel>
-                    )} */}
-                        <TabPanel>
-                            <Signatures transaction={transaction} />
-                        </TabPanel>
-                    </TabPanels>
-                </TabGroup>
-            </div>
-        ),
-        minSize: 35,
-        collapsible: true,
-        collapsibleButton: true,
-        noHoverHidden: isMediumOrAbove,
-    };
-
-    const rightPane = {
-        panel: (
-            <div className="h-full w-full overflow-y-scroll md:overflow-y-hidden">
-                <TransactionData transaction={transaction} />
-            </div>
-        ),
-        minSize: 40,
-        defaultSize: isProgrammableTransaction ? 65 : 50,
-    };
-
-    return (
-        <div className={clsx(styles.txdetailsbg)}>
-            <div className="mb-10">
-                <PageHeader
-                    type="Transaction"
-                    title={getTransactionDigest(transaction)}
-                    subtitle={
-                        !isProgrammableTransaction
-                            ? transactionKindName
-                            : undefined
-                    }
-                    status={getExecutionStatusType(transaction)}
-                />
-                {txError && (
-                    <div className="mt-2">
-                        <Banner variant="error">{txError}</Banner>
-                    </div>
-                )}
-            </div>
-            <div className="h-verticalListLong md:h-full">
-                <SplitPanes
-                    splitPanels={[leftPane, rightPane]}
-                    direction={isMediumOrAbove ? 'horizontal' : 'vertical'}
-                />
-            </div>
-        </div>
-    );
+	return (
+		<div className={clsx(styles.txdetailsbg)}>
+			<div className="mb-10">
+				<PageHeader
+					type="Transaction"
+					title={getTransactionDigest(transaction)}
+					subtitle={!isProgrammableTransaction ? transactionKindName : undefined}
+					status={getExecutionStatusType(transaction)}
+				/>
+				{txError && (
+					<div className="mt-2">
+						<Banner variant="error">{txError}</Banner>
+					</div>
+				)}
+			</div>
+			<div className="h-screen md:h-full">
+				<SplitPanes
+					splitPanels={[leftPane, rightPane]}
+					direction={isMediumOrAbove ? 'horizontal' : 'vertical'}
+				/>
+			</div>
+		</div>
+	);
 }

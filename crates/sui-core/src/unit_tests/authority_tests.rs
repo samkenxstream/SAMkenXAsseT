@@ -2,11 +2,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
-use std::fs;
-use std::{convert::TryInto, env};
-
 use bcs;
+use fastcrypto::traits::KeyPair;
 use futures::{stream::FuturesUnordered, StreamExt};
 use move_binary_format::access::ModuleAccess;
 use move_binary_format::{
@@ -25,6 +22,9 @@ use rand::{
     Rng, SeedableRng,
 };
 use serde_json::json;
+use std::collections::HashSet;
+use std::fs;
+use std::{convert::TryInto, env};
 
 use sui_json_rpc_types::{
     SuiArgument, SuiExecutionResult, SuiExecutionStatus, SuiTransactionBlockEffectsAPI, SuiTypeTag,
@@ -48,13 +48,13 @@ use sui_types::utils::{
 use sui_types::{
     base_types::dbg_addr,
     crypto::{get_key_pair, Signature},
-    crypto::{AccountKeyPair, AuthorityKeyPair, KeypairTraits},
+    crypto::{AccountKeyPair, AuthorityKeyPair},
     object::{Owner, GAS_VALUE_FOR_TESTING, OBJECT_START_VERSION},
-    transaction::VerifiedTransaction,
-    MOVE_STDLIB_OBJECT_ID, SUI_FRAMEWORK_OBJECT_ID, SUI_SYSTEM_STATE_OBJECT_ID,
+    MOVE_STDLIB_PACKAGE_ID, SUI_CLOCK_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID,
+    SUI_SYSTEM_STATE_OBJECT_ID,
 };
-use sui_types::{SUI_CLOCK_OBJECT_ID, SUI_CLOCK_OBJECT_SHARED_VERSION};
 
+use crate::authority::authority_store_tables::AuthorityPerpetualTables;
 use crate::authority::move_integration_tests::build_and_publish_test_package_with_upgrade_cap;
 use crate::authority::test_authority_builder::TestAuthorityBuilder;
 use crate::{
@@ -573,7 +573,7 @@ async fn test_dev_inspect_dynamic_field() {
     };
     let kind = TransactionKind::programmable(pt);
     let DevInspectResults { error, .. } = fullnode
-        .dev_inspect_transaction_block(sender, kind, Some(1))
+        .dev_inspect_transaction_block(sender, kind, None)
         .await
         .unwrap();
     // produces an error
@@ -799,6 +799,68 @@ async fn test_dev_inspect_return_values() {
 }
 
 #[tokio::test]
+async fn test_paranoid_mode_with_natives() {
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let gas_object_id = ObjectID::random();
+    let mut expensive_safety_checks_config = ExpensiveSafetyCheckConfig::default();
+    expensive_safety_checks_config.enable_paranoid_checks();
+    let authority_state = init_state_with_ids_and_expensive_checks(
+        vec![(sender, gas_object_id)],
+        expensive_safety_checks_config,
+    )
+    .await;
+
+    let gas_object = authority_state
+        .get_object(&gas_object_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let gas_object_ref = gas_object.compute_object_reference();
+
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let vector = builder.programmable_move_call(
+        MOVE_STDLIB_PACKAGE_ID,
+        ident_str!("vector").to_owned(),
+        ident_str!("empty").to_owned(),
+        vec![TypeTag::U8],
+        vec![],
+    );
+    let value = builder
+        .input(CallArg::Pure(bcs::to_bytes(&(1_u8)).unwrap()))
+        .unwrap();
+    builder.programmable_move_call(
+        MOVE_STDLIB_PACKAGE_ID,
+        ident_str!("vector").to_owned(),
+        ident_str!("push_back").to_owned(),
+        vec![TypeTag::U8],
+        vec![vector, value],
+    );
+    builder.programmable_move_call(
+        MOVE_STDLIB_PACKAGE_ID,
+        ident_str!("vector").to_owned(),
+        ident_str!("pop_back").to_owned(),
+        vec![TypeTag::U8],
+        vec![vector],
+    );
+
+    let rgp = authority_state.reference_gas_price_for_testing().unwrap();
+    let data = TransactionData::new_programmable(
+        sender,
+        vec![gas_object_ref],
+        builder.finish(),
+        rgp * TEST_ONLY_GAS_UNIT_FOR_OBJECT_BASICS * 10,
+        rgp,
+    );
+
+    let transaction = to_sender_signed_transaction(data, &sender_key);
+    let signed_effects = send_and_confirm_transaction(&authority_state, transaction)
+        .await
+        .unwrap()
+        .1;
+    assert_eq!(signed_effects.data().status(), &ExecutionStatus::Success);
+}
+
+#[tokio::test]
 async fn test_dev_inspect_gas_coin_argument() {
     let (validator, fullnode, _object_basics) =
         init_state_with_ids_and_object_basics_with_fullnode(vec![]).await;
@@ -815,7 +877,7 @@ async fn test_dev_inspect_gas_coin_argument() {
     };
     let kind = TransactionKind::programmable(pt);
     let results = fullnode
-        .dev_inspect_transaction_block(sender, kind, Some(1))
+        .dev_inspect_transaction_block(sender, kind, None)
         .await
         .unwrap()
         .results
@@ -843,6 +905,48 @@ async fn test_dev_inspect_gas_coin_argument() {
     } = &results[1];
     assert!(mutable_reference_outputs.is_empty());
     assert!(return_values.is_empty());
+}
+
+#[tokio::test]
+async fn test_dev_inspect_gas_price() {
+    let (_, fullnode, _object_basics) =
+        init_state_with_ids_and_object_basics_with_fullnode(vec![]).await;
+
+    let sender = SuiAddress::random_for_testing_only();
+    let recipient = SuiAddress::random_for_testing_only();
+    let amount = 500;
+    let pt = {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        builder.pay_sui(vec![recipient], vec![amount]).unwrap();
+        builder.finish()
+    };
+    let kind = TransactionKind::programmable(pt);
+    let error = fullnode
+        .dev_inspect_transaction_block(sender, kind.clone(), Some(1))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            UserInputError::try_from(error.clone()).unwrap(),
+            UserInputError::GasPriceUnderRGP { .. }
+        ),
+        "{}",
+        error
+    );
+    let epoch_store = fullnode.epoch_store_for_testing();
+    let protocol_config = epoch_store.protocol_config();
+    let error = fullnode
+        .dev_inspect_transaction_block(sender, kind, Some(protocol_config.max_gas_price() + 1))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            UserInputError::try_from(error.clone()).unwrap(),
+            UserInputError::GasPriceTooHigh { .. }
+        ),
+        "{}",
+        error
+    );
 }
 
 fn check_coin_value(actual_value: &[u8], actual_type: &SuiTypeTag, expected_value: u64) {
@@ -877,7 +981,11 @@ async fn test_dev_inspect_uses_unbound_object() {
     let kind = TransactionKind::programmable(pt);
 
     let result = fullnode
-        .dev_inspect_transaction_block(sender, kind, Some(1))
+        .dev_inspect_transaction_block(
+            sender,
+            kind,
+            Some(fullnode.reference_gas_price_for_testing().unwrap()),
+        )
         .await;
     let Err(err) = result else { panic!() };
     assert!(err.to_string().contains("ObjectNotFound"));
@@ -921,7 +1029,8 @@ async fn test_dry_run_on_validator() {
     assert!(response.is_err());
 }
 
-// Tests using a dynamic field that a is newer than the parent in dev inspect/dry run
+// Tests using a dynamic field that is newer than the parent in dev inspect/dry run results
+// in not being able to access the dynamic field object
 #[tokio::test]
 async fn test_dry_run_dev_inspect_dynamic_field_too_new() {
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
@@ -997,13 +1106,12 @@ async fn test_dry_run_dev_inspect_dynamic_field_too_new() {
     .unwrap();
     assert_eq!(effects.status(), &ExecutionStatus::Success);
     assert_eq!(effects.created().len(), 1);
-    let field = effects.created()[0].0;
 
     // make sure the parent was updated
     let new_parent = fullnode.get_object(&parent.0).await.unwrap().unwrap();
     assert!(parent.1 < new_parent.version());
 
-    // delete the child, but using the old version of the parent
+    // no child to delete since we are using the old version of the parent
     let pt = ProgrammableTransaction {
         inputs: vec![CallArg::Object(ObjectArg::ImmOrOwnedObject(parent))],
         commands: vec![Command::MoveCall(Box::new(ProgrammableMoveCall {
@@ -1015,17 +1123,15 @@ async fn test_dry_run_dev_inspect_dynamic_field_too_new() {
         }))],
     };
     let kind = TransactionKind::programmable(pt.clone());
+    let rgp = fullnode.reference_gas_price_for_testing().unwrap();
     // dev inspect
     let DevInspectResults { effects, .. } = fullnode
-        .dev_inspect_transaction_block(sender, kind, Some(1))
+        .dev_inspect_transaction_block(sender, kind, Some(rgp))
         .await
         .unwrap();
-    assert_eq!(effects.deleted().len(), 1);
-    let deleted = &effects.deleted()[0];
-    assert_eq!(field.0, deleted.object_id);
-    assert_eq!(deleted.version, SequenceNumber::MAX);
-    let rgp = fullnode.reference_gas_price_for_testing().unwrap();
+    assert_eq!(effects.deleted().len(), 0);
     // dry run
+    let rgp = fullnode.reference_gas_price_for_testing().unwrap();
     let data = TransactionData::new_programmable(
         sender,
         vec![gas_object_ref],
@@ -1037,10 +1143,7 @@ async fn test_dry_run_dev_inspect_dynamic_field_too_new() {
     let digest = *transaction.digest();
     let DryRunTransactionBlockResponse { effects, .. } =
         fullnode.dry_exec_transaction(data, digest).await.unwrap().0;
-    assert_eq!(effects.deleted().len(), 1);
-    let deleted = &effects.deleted()[0];
-    assert_eq!(field.0, deleted.object_id);
-    assert_eq!(deleted.version, SequenceNumber::MAX);
+    assert_eq!(effects.deleted().len(), 0);
 }
 
 // tests using a gas coin with version MAX - 1
@@ -1076,7 +1179,7 @@ async fn test_dry_run_dev_inspect_max_gas_version() {
     let kind = TransactionKind::programmable(pt.clone());
     // dev inspect
     let DevInspectResults { effects, .. } = fullnode
-        .dev_inspect_transaction_block(sender, kind, Some(1))
+        .dev_inspect_transaction_block(sender, kind, Some(rgp + 100))
         .await
         .unwrap();
     assert_eq!(effects.status(), &SuiExecutionStatus::Success);
@@ -2789,9 +2892,10 @@ async fn test_authority_persist() {
     let path = dir.join(format!("DB_{:?}", ObjectID::random()));
     fs::create_dir(&path).unwrap();
 
+    let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(&path, None));
     // Create an authority
     let store =
-        AuthorityStore::open_with_committee_for_testing(&path, None, &committee, &genesis, 0)
+        AuthorityStore::open_with_committee_for_testing(perpetual_tables, &committee, &genesis, 0)
             .await
             .unwrap();
     let authority = init_state(&genesis, authority_key, store).await;
@@ -2815,8 +2919,9 @@ async fn test_authority_persist() {
     let seed = [1u8; 32];
     let (genesis, authority_key) = init_state_parameters_from_rng(&mut StdRng::from_seed(seed));
     let committee = genesis.committee().unwrap();
+    let perpetual_tables = Arc::new(AuthorityPerpetualTables::open(&path, None));
     let store =
-        AuthorityStore::open_with_committee_for_testing(&path, None, &committee, &genesis, 0)
+        AuthorityStore::open_with_committee_for_testing(perpetual_tables, &committee, &genesis, 0)
             .await
             .unwrap();
     let authority2 = init_state(&genesis, authority_key, store).await;
@@ -2926,11 +3031,7 @@ async fn test_invalid_mutable_clock_parameter() {
         ident_str!("use_clock").to_owned(),
         /* type_args */ vec![],
         gas_ref,
-        vec![CallArg::Object(ObjectArg::SharedObject {
-            id: SUI_CLOCK_OBJECT_ID,
-            initial_shared_version: SUI_CLOCK_OBJECT_SHARED_VERSION,
-            mutable: true,
-        })],
+        vec![CallArg::CLOCK_MUT],
         TEST_ONLY_GAS_UNIT_FOR_OBJECT_BASICS * rgp,
         rgp,
     )
@@ -2969,11 +3070,7 @@ async fn test_valid_immutable_clock_parameter() {
         ident_str!("use_clock").to_owned(),
         /* type_args */ vec![],
         gas_ref,
-        vec![CallArg::Object(ObjectArg::SharedObject {
-            id: SUI_CLOCK_OBJECT_ID,
-            initial_shared_version: SUI_CLOCK_OBJECT_SHARED_VERSION,
-            mutable: false,
-        })],
+        vec![CallArg::CLOCK_IMM],
         TEST_ONLY_GAS_UNIT_FOR_OBJECT_BASICS * rgp,
         rgp,
     )
@@ -3709,8 +3806,7 @@ async fn test_iter_live_object_set() {
     let obj_id = ObjectID::random();
     let authority = init_state_with_ids(vec![(sender, gas), (sender, obj_id)]).await;
     let starting_live_set: HashSet<_> = authority
-        .database
-        .iter_live_object_set()
+        .iter_live_object_set_for_testing()
         .filter_map(|object| {
             let id = object.object_id();
             if id != gas && id != obj_id {
@@ -3893,8 +3989,7 @@ fn check_live_set(
     expected.sort();
 
     let actual: Vec<_> = authority
-        .database
-        .iter_live_object_set()
+        .iter_live_object_set_for_testing()
         .filter_map(|object| {
             let id = object.object_id();
             if ignore.contains(&id) {
@@ -4058,7 +4153,7 @@ pub async fn call_move_(
         *sender,
         vec![gas_object_ref],
         builder.finish(),
-        rgp * TEST_ONLY_GAS_UNIT_FOR_OBJECT_BASICS * 10,
+        rgp * TEST_ONLY_GAS_UNIT_FOR_OBJECT_BASICS * 5,
         rgp,
     );
 
@@ -4293,7 +4388,7 @@ pub async fn call_dev_inspect(
     function: &str,
     type_arguments: Vec<TypeTag>,
     test_args: Vec<TestCallArg>,
-) -> Result<DevInspectResults, anyhow::Error> {
+) -> SuiResult<DevInspectResults> {
     let mut builder = ProgrammableTransactionBuilder::new();
     let mut arguments = Vec::with_capacity(test_args.len());
     for a in test_args {
@@ -4308,8 +4403,9 @@ pub async fn call_dev_inspect(
         arguments,
     ));
     let kind = TransactionKind::programmable(builder.finish());
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
     authority
-        .dev_inspect_transaction_block(*sender, kind, Some(1))
+        .dev_inspect_transaction_block(*sender, kind, Some(rgp))
         .await
 }
 
@@ -4338,7 +4434,7 @@ async fn make_test_transaction(
         .unwrap();
     let data = TransactionData::new_move_call(
         *sender,
-        SUI_FRAMEWORK_OBJECT_ID,
+        SUI_FRAMEWORK_PACKAGE_ID,
         ident_str!(module).to_owned(),
         ident_str!(function).to_owned(),
         /* type_args */ vec![],
@@ -4486,7 +4582,7 @@ async fn test_consensus_message_processed() {
     let initial_shared_version = shared_object.version();
 
     let dir = tempfile::TempDir::new().unwrap();
-    let network_config = sui_config::builder::ConfigBuilder::new(&dir)
+    let network_config = sui_swarm_config::network_config_builder::ConfigBuilder::new(&dir)
         .committee_size(2.try_into().unwrap())
         .with_objects(vec![gas_object.clone(), shared_object.clone()])
         .build();
@@ -4973,7 +5069,11 @@ async fn test_for_inc_201_dev_inspect() {
     ));
     let kind = TransactionKind::programmable(builder.finish());
     let DevInspectResults { events, .. } = fullnode
-        .dev_inspect_transaction_block(sender, kind, Some(1))
+        .dev_inspect_transaction_block(
+            sender,
+            kind,
+            Some(fullnode.reference_gas_price_for_testing().unwrap() + 1000),
+        )
         .await
         .unwrap();
 
@@ -5006,16 +5106,31 @@ async fn test_for_inc_201_dry_run() {
     builder.publish_immutable(modules, BuiltInFramework::all_package_ids());
     let kind = TransactionKind::programmable(builder.finish());
 
-    let txn_data = TransactionData::new_with_gas_coins(kind, sender, vec![], 50_000_000, 1);
+    let rgp = fullnode.reference_gas_price_for_testing().unwrap();
+    let txn_data = TransactionData::new_with_gas_coins(
+        kind,
+        sender,
+        vec![],
+        TEST_ONLY_GAS_UNIT_FOR_PUBLISH * rgp,
+        rgp,
+    );
 
     let signed = to_sender_signed_transaction(txn_data, &sender_key);
-    let (DryRunTransactionBlockResponse { events, .. }, _, _, _) = fullnode
+    let (
+        DryRunTransactionBlockResponse {
+            events, effects, ..
+        },
+        _,
+        _,
+        _,
+    ) = fullnode
         .dry_exec_transaction(
             signed.data().intent_message().value.clone(),
             *signed.digest(),
         )
         .await
         .unwrap();
+    assert_eq!(effects.status(), &SuiExecutionStatus::Success);
 
     assert_eq!(1, events.data.len());
     assert_eq!(
@@ -5065,7 +5180,7 @@ async fn test_publish_transitive_dependencies_ok() {
         sender,
         vec![gas_ref],
         rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
-        1,
+        rgp,
     );
     let signed = to_sender_signed_transaction(txn_data, &key);
     let txn_effects = send_and_confirm_transaction(&state, signed)
@@ -5101,7 +5216,7 @@ async fn test_publish_transitive_dependencies_ok() {
         sender,
         vec![gas_ref],
         rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
-        1,
+        rgp,
     );
     let signed = to_sender_signed_transaction(txn_data, &key);
     let txn_effects = send_and_confirm_transaction(&state, signed)
@@ -5138,7 +5253,7 @@ async fn test_publish_transitive_dependencies_ok() {
         sender,
         vec![gas_ref],
         rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
-        1,
+        rgp,
     );
     let signed = to_sender_signed_transaction(txn_data, &key);
     let txn_effects = send_and_confirm_transaction(&state, signed)
@@ -5220,10 +5335,17 @@ async fn test_publish_missing_dependency() {
         .get_package_bytes(/* with_unpublished_deps */ false);
 
     let mut builder = ProgrammableTransactionBuilder::new();
-    builder.publish_immutable(modules, vec![SUI_FRAMEWORK_OBJECT_ID]);
+    builder.publish_immutable(modules, vec![SUI_FRAMEWORK_PACKAGE_ID]);
     let kind = TransactionKind::programmable(builder.finish());
 
-    let txn_data = TransactionData::new_with_gas_coins(kind, sender, vec![gas_ref], 10000, 1);
+    let rgp = state.reference_gas_price_for_testing().unwrap();
+    let txn_data = TransactionData::new_with_gas_coins(
+        kind,
+        sender,
+        vec![gas_ref],
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
+    );
 
     let signed = to_sender_signed_transaction(txn_data, &key);
     let (failure, _) = send_and_confirm_transaction(&state, signed)
@@ -5262,10 +5384,17 @@ async fn test_publish_missing_transitive_dependency() {
         .get_package_bytes(/* with_unpublished_deps */ false);
 
     let mut builder = ProgrammableTransactionBuilder::new();
-    builder.publish_immutable(modules, vec![MOVE_STDLIB_OBJECT_ID]);
+    builder.publish_immutable(modules, vec![MOVE_STDLIB_PACKAGE_ID]);
     let kind = TransactionKind::programmable(builder.finish());
 
-    let txn_data = TransactionData::new_with_gas_coins(kind, sender, vec![gas_ref], 10000, 1);
+    let rgp = state.reference_gas_price_for_testing().unwrap();
+    let txn_data = TransactionData::new_with_gas_coins(
+        kind,
+        sender,
+        vec![gas_ref],
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
+    );
 
     let signed = to_sender_signed_transaction(txn_data, &key);
     let (failure, _) = send_and_confirm_transaction(&state, signed)
@@ -5310,7 +5439,14 @@ async fn test_publish_not_a_package_dependency() {
     builder.publish_immutable(modules, deps);
     let kind = TransactionKind::programmable(builder.finish());
 
-    let txn_data = TransactionData::new_with_gas_coins(kind, sender, vec![gas_ref], 10000, 1);
+    let rgp = state.reference_gas_price_for_testing().unwrap();
+    let txn_data = TransactionData::new_with_gas_coins(
+        kind,
+        sender,
+        vec![gas_ref],
+        rgp * TEST_ONLY_GAS_UNIT_FOR_PUBLISH,
+        rgp,
+    );
 
     let signed = to_sender_signed_transaction(txn_data, &key);
     let failure = send_and_confirm_transaction(&state, signed)

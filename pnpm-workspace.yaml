@@ -1,4 +1,7 @@
 packages:
-  - "sdk/**"
-  - "apps/**"
-  - "dapps/sponsored-transactions"
+    - 'sdk/**'
+    - 'apps/**'
+    - 'dapps/**'
+    - '!**/dist/**'
+    - '!sdk/typescript/builder'
+    - '!sdk/typescript/*/**'

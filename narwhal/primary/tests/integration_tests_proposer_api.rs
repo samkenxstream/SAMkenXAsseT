@@ -13,13 +13,14 @@ use fastcrypto::{
 use narwhal_primary as primary;
 use narwhal_primary::NUM_SHUTDOWN_RECEIVERS;
 use network::client::NetworkClient;
-use primary::{NetworkModel, Primary, CHANNEL_CAPACITY};
+use primary::{Primary, CHANNEL_CAPACITY};
 use prometheus::Registry;
 use rand::thread_rng;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use storage::NodeStorage;
 use test_utils::{
-    make_optimal_certificates, make_optimal_signed_certificates, temp_dir, CommitteeFixture,
+    latest_protocol_version, make_optimal_certificates, make_optimal_signed_certificates, temp_dir,
+    CommitteeFixture,
 };
 use tokio::sync::watch;
 use tonic::transport::Channel;
@@ -99,6 +100,7 @@ async fn test_rounds_errors() {
                 authority.stake(),
                 authority.primary_address(),
                 authority.network_key(),
+                authority.id().to_string(),
             );
         }
     }
@@ -113,6 +115,7 @@ async fn test_rounds_errors() {
         network_keypair,
         committee.clone(),
         worker_cache,
+        latest_protocol_version(),
         parameters.clone(),
         client,
         store_primary.header_store,
@@ -133,7 +136,6 @@ async fn test_rounds_errors() {
             )
             .1,
         )),
-        NetworkModel::Asynchronous,
         &mut tx_shutdown,
         tx_feedback,
         &Registry::new(),
@@ -216,6 +218,7 @@ async fn test_rounds_return_successful_response() {
         author.network_keypair().copy(),
         committee.clone(),
         worker_cache,
+        latest_protocol_version(),
         parameters.clone(),
         client,
         store_primary.header_store,
@@ -227,7 +230,6 @@ async fn test_rounds_return_successful_response() {
         rx_feedback,
         rx_consensus_round_updates,
         /* external_consensus */ Some(dag.clone()),
-        NetworkModel::Asynchronous,
         &mut tx_shutdown,
         tx_feedback,
         &Registry::new(),
@@ -245,6 +247,7 @@ async fn test_rounds_return_successful_response() {
         .collect::<BTreeSet<_>>();
     let (mut certificates, _next_parents) = make_optimal_certificates(
         &committee,
+        &latest_protocol_version(),
         1..=4,
         &genesis,
         &committee
@@ -333,8 +336,13 @@ async fn test_node_read_causal_signed_certificates() {
         .authorities()
         .map(|a| (a.id(), a.keypair().copy()))
         .collect::<Vec<_>>();
-    let (certificates, _next_parents) =
-        make_optimal_signed_certificates(1..=4, &genesis, &committee, &keys);
+    let (certificates, _next_parents) = make_optimal_signed_certificates(
+        1..=4,
+        &genesis,
+        &committee,
+        &latest_protocol_version(),
+        &keys,
+    );
 
     collection_ids.extend(
         certificates
@@ -380,6 +388,7 @@ async fn test_node_read_causal_signed_certificates() {
         authority_1.network_keypair().copy(),
         committee.clone(),
         worker_cache.clone(),
+        latest_protocol_version(),
         primary_1_parameters.clone(),
         client_1,
         primary_store_1.header_store.clone(),
@@ -391,7 +400,6 @@ async fn test_node_read_causal_signed_certificates() {
         rx_feedback,
         rx_consensus_round_updates,
         /* dag */ Some(dag.clone()),
-        NetworkModel::Asynchronous,
         &mut tx_shutdown,
         tx_feedback,
         &Registry::new(),
@@ -419,6 +427,7 @@ async fn test_node_read_causal_signed_certificates() {
         authority_2.network_keypair().copy(),
         committee.clone(),
         worker_cache.clone(),
+        latest_protocol_version(),
         primary_2_parameters.clone(),
         client_2,
         primary_store_2.header_store,
@@ -439,7 +448,6 @@ async fn test_node_read_causal_signed_certificates() {
             )
             .1,
         )),
-        NetworkModel::Asynchronous,
         &mut tx_shutdown_2,
         tx_feedback_2,
         &Registry::new(),

@@ -84,6 +84,36 @@ async fn test_contains_key(#[values(true, false)] is_transactional: bool) {
 
 #[rstest]
 #[tokio::test]
+async fn test_multi_contain(#[values(true, false)] is_transactional: bool) {
+    let db = open_map(temp_dir(), None, is_transactional);
+
+    db.insert(&123, &"123".to_string())
+        .expect("Failed to insert");
+    db.insert(&456, &"456".to_string())
+        .expect("Failed to insert");
+    db.insert(&789, &"789".to_string())
+        .expect("Failed to insert");
+
+    let result = db
+        .multi_contains_keys([123, 456])
+        .expect("Failed to check multi keys existence");
+
+    assert_eq!(result.len(), 2);
+    assert!(result[0]);
+    assert!(result[1]);
+
+    let result = db
+        .multi_contains_keys([123, 987, 789])
+        .expect("Failed to check multi keys existence");
+
+    assert_eq!(result.len(), 3);
+    assert!(result[0]);
+    assert!(!result[1]);
+    assert!(result[2]);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_get(#[values(true, false)] is_transactional: bool) {
     let db = open_map(temp_dir(), None, is_transactional);
 
@@ -487,7 +517,7 @@ async fn test_delete_range() {
         MetricConf::default(),
         None,
         None,
-        &ReadWriteOptions::default(),
+        &ReadWriteOptions::default().set_ignore_range_deletions(false),
     )
     .expect("Failed to open storage");
 
@@ -600,6 +630,101 @@ async fn test_iter_with_bounds(#[values(true, false)] is_transactional: bool) {
         .iter_with_bounds(Some(1), Some(50))
         .skip_prior_to(&50)
         .unwrap();
+    assert_eq!(vec![(49, "49".to_string())], db_iter.collect::<Vec<_>>());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_range_iter(#[values(true, false)] is_transactional: bool) {
+    let db = open_map(temp_dir(), None, is_transactional);
+    let min = u64::MAX - 100;
+    let max = u64::MAX;
+    for i in min..=max {
+        if i != min + 50 {
+            db.insert(&i, &i.to_string()).unwrap();
+        }
+    }
+    let db_iter = db.range_iter(min..=max).skip_prior_to(&(min + 50)).unwrap();
+
+    assert_eq!(
+        (min + 49..min + 50)
+            .chain(min + 51..=max)
+            .map(|i| (i, i.to_string()))
+            .collect::<Vec<_>>(),
+        db_iter.collect::<Vec<_>>()
+    );
+
+    let db = open_map(temp_dir(), None, is_transactional);
+
+    // Add [1, 50) and (50, 100) in the db
+    for i in 1..100 {
+        if i != 50 {
+            db.insert(&i, &i.to_string()).unwrap();
+        }
+    }
+
+    // Skip prior to will return an iterator starting with an "unexpected" key if the sought one is not in the table
+    let db_iter = db.range_iter(1..=99).skip_prior_to(&50).unwrap();
+
+    assert_eq!(
+        (49..50)
+            .chain(51..100)
+            .map(|i| (i, i.to_string()))
+            .collect::<Vec<_>>(),
+        db_iter.collect::<Vec<_>>()
+    );
+
+    let db_iter = db.range_iter(1..=99).skip_prior_to(&1).unwrap();
+
+    assert_eq!(
+        (1..50)
+            .chain(51..100)
+            .map(|i| (i, i.to_string()))
+            .collect::<Vec<_>>(),
+        db_iter.collect::<Vec<_>>()
+    );
+
+    let db_iter = db.range_iter(2..=99).skip_prior_to(&2).unwrap();
+
+    assert_eq!(
+        (2..50)
+            .chain(51..100)
+            .map(|i| (i, i.to_string()))
+            .collect::<Vec<_>>(),
+        db_iter.collect::<Vec<_>>()
+    );
+
+    let db_iter = db.range_iter(2..99).skip_prior_to(&2).unwrap();
+
+    assert_eq!(
+        (2..50)
+            .chain(51..99)
+            .map(|i| (i, i.to_string()))
+            .collect::<Vec<_>>(),
+        db_iter.collect::<Vec<_>>()
+    );
+
+    // Same logic in the keys iterator
+    let db_iter = db.keys().skip_prior_to(&50).unwrap();
+
+    assert_eq!(
+        (49..50).chain(51..100).map(Ok).collect::<Vec<_>>(),
+        db_iter.collect::<Vec<_>>()
+    );
+
+    // Skip to a key which is not within the bounds (bound is [1, 50))
+    let db_iter = db.range_iter(1..=50).skip_to(&50).unwrap();
+    assert_eq!(Vec::<(i32, String)>::new(), db_iter.collect::<Vec<_>>());
+
+    // Skip to first key in the bound (bound is [1, 49))
+    let db_iter = db.range_iter(1..49).skip_to(&1).unwrap();
+    assert_eq!(
+        (1..49).map(|i| (i, i.to_string())).collect::<Vec<_>>(),
+        db_iter.collect::<Vec<_>>()
+    );
+
+    // Skip to a key which is not within the bounds (bound is [1, 50))
+    let db_iter = db.range_iter(1..=50).skip_prior_to(&50).unwrap();
     assert_eq!(vec![(49, "49".to_string())], db_iter.collect::<Vec<_>>());
 }
 

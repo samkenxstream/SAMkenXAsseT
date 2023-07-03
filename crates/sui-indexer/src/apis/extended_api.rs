@@ -10,8 +10,8 @@ use sui_json_rpc::api::{
 };
 use sui_json_rpc::SuiRpcModule;
 use sui_json_rpc_types::{
-    CheckpointedObjectID, EpochInfo, EpochPage, MoveCallMetrics, NetworkMetrics, Page,
-    QueryObjectsPage, SuiObjectDataFilter, SuiObjectResponse, SuiObjectResponseQuery,
+    AddressMetrics, CheckpointedObjectID, EpochInfo, EpochPage, MoveCallMetrics, NetworkMetrics,
+    Page, QueryObjectsPage, SuiObjectDataFilter, SuiObjectResponse, SuiObjectResponseQuery,
 };
 use sui_open_rpc::Module;
 use sui_types::sui_serde::BigInt;
@@ -126,6 +126,33 @@ impl<S: IndexerStore + Sync + Send + 'static> ExtendedApiServer for ExtendedApi<
 
     async fn get_move_call_metrics(&self) -> RpcResult<MoveCallMetrics> {
         Ok(self.state.get_move_call_metrics().await?)
+    }
+
+    async fn get_latest_address_metrics(&self) -> RpcResult<AddressMetrics> {
+        let address_stats = self.state.get_latest_address_stats().await?;
+        Ok(AddressMetrics::from(address_stats))
+    }
+
+    async fn get_checkpoint_address_metrics(&self, checkpoint: u64) -> RpcResult<AddressMetrics> {
+        let address_stats = self
+            .state
+            .get_checkpoint_address_stats(checkpoint as i64)
+            .await?;
+        Ok(AddressMetrics::from(address_stats))
+    }
+
+    async fn get_all_epoch_address_metrics(
+        &self,
+        descending_order: Option<bool>,
+    ) -> RpcResult<Vec<AddressMetrics>> {
+        let epoch_address_stats = self
+            .state
+            .get_all_epoch_address_stats(descending_order)
+            .await?;
+        Ok(epoch_address_stats
+            .into_iter()
+            .map(AddressMetrics::from)
+            .collect())
     }
 }
 

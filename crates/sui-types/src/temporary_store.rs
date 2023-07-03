@@ -1,26 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
-
 use move_binary_format::CompiledModule;
 use move_bytecode_utils::module_cache::GetModule;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::language_storage::{ModuleId, StructTag};
-use move_core_types::resolver::{LinkageResolver, ModuleResolver, ResourceResolver};
+use move_core_types::resolver::{ModuleResolver, ResourceResolver};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use sui_protocol_config::ProtocolConfig;
 use tracing::trace;
 
 use crate::committee::EpochId;
 use crate::effects::{TransactionEffects, TransactionEvents};
 use crate::execution_status::ExecutionStatus;
-use crate::storage::ObjectStore;
+use crate::storage::{DeleteKindWithOldVersion, ObjectStore};
 use crate::sui_system_state::{
     get_sui_system_state, get_sui_system_state_wrapper, AdvanceEpochParams, SuiSystemState,
 };
+use crate::type_resolver::LayoutResolver;
 use crate::{
     base_types::{
         ObjectDigest, ObjectID, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest,
@@ -48,13 +49,16 @@ pub type TxCoins = (ObjectMap, WrittenObjects);
 pub struct InnerTemporaryStore {
     pub objects: ObjectMap,
     pub mutable_inputs: Vec<ObjectRef>,
+    // All the written objects' sequence number should have been updated to the lamport version.
     pub written: WrittenObjects,
-    // deleted or wrapped or unwrap-then-delete
+    // deleted or wrapped or unwrap-then-delete. The sequence number should have been updated to
+    // the lamport version.
     pub deleted: BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
     pub loaded_child_objects: BTreeMap<ObjectID, SequenceNumber>,
     pub events: TransactionEvents,
     pub max_binary_format_version: u32,
     pub no_extraneous_module_bytes: bool,
+    pub runtime_read_objects: BTreeMap<ObjectID, Object>,
 }
 
 impl InnerTemporaryStore {
@@ -134,13 +138,36 @@ where
     }
 }
 
-pub struct TemporaryStore<S> {
+pub trait BackingStore:
+    BackingPackageStore
+    + ChildObjectResolver
+    + GetModule<Error = SuiError, Item = CompiledModule>
+    + ObjectStore
+    + ParentSync
+{
+    fn as_object_store(&self) -> &dyn ObjectStore;
+}
+
+impl<T> BackingStore for T
+where
+    T: BackingPackageStore,
+    T: ChildObjectResolver,
+    T: GetModule<Error = SuiError, Item = CompiledModule>,
+    T: ObjectStore,
+    T: ParentSync,
+{
+    fn as_object_store(&self) -> &dyn ObjectStore {
+        self
+    }
+}
+
+pub struct TemporaryStore<'backing> {
     // The backing store for retrieving Move packages onchain.
     // When executing a Move call, the dependent packages are not going to be
     // in the input objects. They will be fetched from the backing store.
     // Also used for fetching the backing parent_sync to get the last known version for wrapped
     // objects
-    store: S,
+    store: Arc<dyn BackingStore + Send + Sync + 'backing>,
     tx_digest: TransactionDigest,
     input_objects: BTreeMap<ObjectID, Object>,
     /// The version to assign to all objects written by the transaction using this store.
@@ -151,7 +178,7 @@ pub struct TemporaryStore<S> {
     // into written directly.
     written: BTreeMap<ObjectID, (Object, WriteKind)>, // Objects written
     /// Objects actively deleted.
-    deleted: BTreeMap<ObjectID, (SequenceNumber, DeleteKind)>,
+    deleted: BTreeMap<ObjectID, DeleteKindWithOldVersion>,
     /// Child objects loaded during dynamic field opers
     /// Currently onply populated for full nodes, not for validators
     loaded_child_objects: BTreeMap<ObjectID, SequenceNumber>,
@@ -160,13 +187,16 @@ pub struct TemporaryStore<S> {
     gas_charged: Option<(ObjectID, GasCostSummary)>,
     storage_rebate_rate: u64,
     protocol_config: ProtocolConfig,
+
+    // Every object that was read from store during exec
+    runtime_read_objects: RwLock<BTreeMap<ObjectID, Object>>,
 }
 
-impl<S> TemporaryStore<S> {
+impl<'backing> TemporaryStore<'backing> {
     /// Creates a new store associated with an authority store, and populates it with
     /// initial objects.
     pub fn new(
-        store: S,
+        store: Arc<dyn BackingStore + Send + Sync + 'backing>,
         input_objects: InputObjects,
         tx_digest: TransactionDigest,
         protocol_config: &ProtocolConfig,
@@ -187,6 +217,7 @@ impl<S> TemporaryStore<S> {
             storage_rebate_rate: protocol_config.storage_rebate_rate(),
             protocol_config: protocol_config.clone(),
             loaded_child_objects: BTreeMap::new(),
+            runtime_read_objects: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -197,7 +228,7 @@ impl<S> TemporaryStore<S> {
     /// version for any object used in the transaction (preventing internal assertions or
     /// invariant violations from being triggered)
     pub fn new_for_mock_transaction(
-        store: S,
+        store: Arc<dyn BackingStore + Send + Sync + 'backing>,
         input_objects: InputObjects,
         tx_digest: TransactionDigest,
         protocol_config: &ProtocolConfig,
@@ -218,6 +249,7 @@ impl<S> TemporaryStore<S> {
             storage_rebate_rate: protocol_config.storage_rebate_rate(),
             protocol_config: protocol_config.clone(),
             loaded_child_objects: BTreeMap::new(),
+            runtime_read_objects: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -273,10 +305,12 @@ impl<S> TemporaryStore<S> {
             written.insert(id, (obj.compute_object_reference(), obj, kind));
         }
 
-        for (id, (mut version, kind)) in self.deleted {
-            // Update the version, post-delete.
-            version.increment_to(self.lamport_timestamp);
-            deleted.insert(id, (version, kind));
+        for (id, kind) in self.deleted {
+            // Check invariant that version must increase.
+            if let Some(version) = kind.old_version() {
+                debug_assert!(version < self.lamport_timestamp);
+            }
+            deleted.insert(id, (self.lamport_timestamp, kind.to_delete_kind()));
         }
 
         // Combine object events with move events.
@@ -290,6 +324,7 @@ impl<S> TemporaryStore<S> {
             max_binary_format_version: self.protocol_config.move_binary_format_version(),
             loaded_child_objects: self.loaded_child_objects,
             no_extraneous_module_bytes: self.protocol_config.no_extraneous_module_bytes(),
+            runtime_read_objects: self.runtime_read_objects.read().clone(),
         }
     }
 
@@ -331,8 +366,10 @@ impl<S> TemporaryStore<S> {
             }
         });
 
-        self.deleted.iter_mut().for_each(|(id, (version, _))| {
-            modified_at_versions.push((*id, *version));
+        self.deleted.iter_mut().for_each(|(id, kind)| {
+            if let Some(version) = kind.old_version() {
+                modified_at_versions.push((*id, version));
+            }
         });
 
         let protocol_version = self.protocol_config.version;
@@ -440,6 +477,20 @@ impl<S> TemporaryStore<S> {
             },
             "Object previous transaction not properly set",
         );
+
+        if self.protocol_config.simplified_unwrap_then_delete() {
+            debug_assert!(self.deleted.iter().all(|(_, kind)| {
+                !matches!(
+                    kind,
+                    DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_)
+                )
+            }));
+        } else {
+            debug_assert!(self
+                .deleted
+                .iter()
+                .all(|(_, kind)| { !matches!(kind, DeleteKindWithOldVersion::UnwrapThenDelete) }));
+        }
     }
 
     // Invariant: A key assumption of the write-delete logic
@@ -503,7 +554,7 @@ impl<S> TemporaryStore<S> {
             // delete all gas objects except the primary_gas_object
             for (id, version, _digest) in &gas[1..] {
                 debug_assert_ne!(*id, primary_gas_object.id());
-                self.delete_object(id, *version, DeleteKind::Normal)
+                self.delete_object(id, DeleteKindWithOldVersion::Normal(*version));
             }
             // unwrap is safe because we checked that the primary gas object was a coin object above.
             primary_gas_object
@@ -516,7 +567,7 @@ impl<S> TemporaryStore<S> {
         Ok(gas[0])
     }
 
-    pub fn delete_object(&mut self, id: &ObjectID, version: SequenceNumber, kind: DeleteKind) {
+    pub fn delete_object(&mut self, id: &ObjectID, kind: DeleteKindWithOldVersion) {
         // there should be no deletion after write
         debug_assert!(self.written.get(id).is_none());
 
@@ -530,13 +581,13 @@ impl<S> TemporaryStore<S> {
                 // In addition, gas objects should never be immutable, so gas smashing
                 // should not allow us to delete immutable objects
                 let digest = self.tx_digest;
-                panic!("Internal invariant violation in tx {digest}: Deleting immutable object {id}, version {version}, delete kind {kind}")
+                panic!("Internal invariant violation in tx {digest}: Deleting immutable object {id}, delete kind {kind:?}")
             }
         }
 
         // For object deletion, we will increment the version when converting the store to effects
         // so the object will eventually show up in the parent_sync table with a new version.
-        self.deleted.insert(*id, (version, kind));
+        self.deleted.insert(*id, kind);
     }
 
     pub fn drop_writes(&mut self) {
@@ -572,7 +623,7 @@ impl<S> TemporaryStore<S> {
         for (id, change) in changes {
             match change {
                 ObjectChange::Write(new_value, kind) => self.write_object(new_value, kind),
-                ObjectChange::Delete(version, kind) => self.delete_object(&id, version, kind),
+                ObjectChange::Delete(kind) => self.delete_object(&id, kind),
             }
         }
     }
@@ -624,7 +675,7 @@ impl<S> TemporaryStore<S> {
     }
 }
 
-impl<S: ObjectStore> TemporaryStore<S> {
+impl<'backing> TemporaryStore<'backing> {
     /// returns lists of (objects whose owner we must authenticate, objects whose owner has already been authenticated)
     fn get_objects_to_authenticate(
         &self,
@@ -705,12 +756,12 @@ impl<S: ObjectStore> TemporaryStore<S> {
             }
         }
 
-        for (id, (_version, kind)) in &self.deleted {
+        for (id, kind) in &self.deleted {
             if authenticated_objs.contains(id) || gas_objs.contains(id) {
                 continue;
             }
             match kind {
-                DeleteKind::Normal | DeleteKind::Wrap => {
+                DeleteKindWithOldVersion::Normal(_) | DeleteKindWithOldVersion::Wrap(_) => {
                     // get owner at beginning of tx
                     let old_obj = self.store.get_object(id)?.unwrap();
                     match &old_obj.owner {
@@ -723,7 +774,8 @@ impl<S: ObjectStore> TemporaryStore<S> {
                         Owner::Immutable => unreachable!("Immutable objects cannot be deleted"),
                     }
                 }
-                DeleteKind::UnwrapThenDelete => {
+                DeleteKindWithOldVersion::UnwrapThenDelete
+                | DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_) => {
                     // unwrapped-then-deleted object was not an input to the tx,
                     // no ownership checks needed
                 }
@@ -775,7 +827,7 @@ impl<S: ObjectStore> TemporaryStore<S> {
 // This is the original gas charging code, all code between comment
 // "Charge gas legacy - start/end" is exclusively for legacy gas
 //==============================================================================
-impl<S: ObjectStore> TemporaryStore<S> {
+impl<'backing> TemporaryStore<'backing> {
     /// 1. Compute tx storage gas costs and tx storage rebates, update storage_rebate field of mutated objects
     /// 2. Deduct computation gas costs and storage costs to `gas_object_id`, credit storage rebates to `gas_object_id`.
     /// gas_object_id can be None if this is a system transaction.
@@ -934,15 +986,17 @@ impl<S: ObjectStore> TemporaryStore<S> {
             total_bytes_written_deleted += old_object_size + new_object_size;
         }
 
-        for (object_id, (version, kind)) in &self.deleted {
+        for (object_id, kind) in &self.deleted {
             match kind {
-                DeleteKind::Wrap | DeleteKind::Normal => {
+                DeleteKindWithOldVersion::Wrap(version)
+                | DeleteKindWithOldVersion::Normal(version) => {
                     let (storage_rebate, object_size) =
                         self.get_input_storage_rebate_and_size(object_id, *version)?;
                     gas_status.charge_storage_mutation(0, storage_rebate)?;
                     total_bytes_written_deleted += object_size;
                 }
-                DeleteKind::UnwrapThenDelete => {
+                DeleteKindWithOldVersion::UnwrapThenDelete
+                | DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_) => {
                     // an unwrapped object does not have a storage rebate, we will charge for storage changes via its wrapper object
                 }
             }
@@ -965,7 +1019,7 @@ impl<S: ObjectStore> TemporaryStore<S> {
 // This is the new/current/latest gas charging code, all code between comment
 // "Charge gas current - start/end" is exclusively for latest gas
 //==============================================================================
-impl<S: ObjectStore> TemporaryStore<S> {
+impl<'backing> TemporaryStore<'backing> {
     /// 1. Compute tx storage gas costs and tx storage rebates, update storage_rebate field of mutated objects
     /// 2. Deduct computation gas costs and storage costs to `gas_object_id`, credit storage rebates to `gas_object_id`.
     // The happy path of this function follows (1) + (2) and is fairly simple. Most of the complexity is in the unhappy paths:
@@ -1193,14 +1247,16 @@ impl<S: ObjectStore> TemporaryStore<S> {
     }
 
     fn collect_rebate(&self, gas_status: &mut SuiGasStatus) {
-        for (object_id, (version, kind)) in &self.deleted {
+        for (object_id, kind) in &self.deleted {
             match kind {
-                DeleteKind::Wrap | DeleteKind::Normal => {
+                DeleteKindWithOldVersion::Wrap(version)
+                | DeleteKindWithOldVersion::Normal(version) => {
                     // get and track the deleted object `storage_rebate`
                     let storage_rebate = self.get_input_storage_rebate(object_id, *version);
                     gas_status.track_storage_mutation(0, storage_rebate);
                 }
-                DeleteKind::UnwrapThenDelete => {
+                DeleteKindWithOldVersion::UnwrapThenDelete
+                | DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_) => {
                     // an unwrapped object does not have a storage rebate, we will charge for storage changes via its wrapper object
                 }
             }
@@ -1211,35 +1267,44 @@ impl<S: ObjectStore> TemporaryStore<S> {
 // Charge gas current - end
 //==============================================================================
 
-impl<S: ObjectStore> TemporaryStore<S> {
+impl<'backing> TemporaryStore<'backing> {
     pub fn advance_epoch_safe_mode(
         &mut self,
         params: &AdvanceEpochParams,
         protocol_config: &ProtocolConfig,
     ) {
-        let wrapper = get_sui_system_state_wrapper(&self.store)
+        let wrapper = get_sui_system_state_wrapper(self.store.as_object_store())
             .expect("System state wrapper object must exist");
-        let new_object = wrapper.advance_epoch_safe_mode(params, &self.store, protocol_config);
+        let new_object =
+            wrapper.advance_epoch_safe_mode(params, self.store.as_object_store(), protocol_config);
         self.write_object(new_object, WriteKind::Mutate);
     }
 }
 
-impl<S: GetModule + ObjectStore + BackingPackageStore> TemporaryStore<S> {
+impl<'backing> TemporaryStore<'backing> {
     fn get_input_sui(
         &self,
         id: &ObjectID,
         expected_version: SequenceNumber,
+        layout_resolver: &mut impl LayoutResolver,
         do_expensive_checks: bool,
     ) -> Result<(u64, u64), ExecutionError> {
         if let Some(obj) = self.input_objects.get(id) {
             // the assumption here is that if it is in the input objects must be the right one
             if obj.version() != expected_version {
-                return Err(ExecutionError::invariant_violation(format!("Version mismatching when resolving input object to check conservation--expected {}, got {}", expected_version, obj.version())));
+                invariant_violation!(
+                    "Version mismatching when resolving input object to check conservation--\
+                     expected {}, got {}",
+                    expected_version,
+                    obj.version(),
+                );
             }
             let input_sui = if do_expensive_checks {
-                obj.get_total_sui(&self).map_err(|_e| {
-                    ExecutionError::invariant_violation(
-                        "Failed looking up output SUI in SUI conservation checking",
+                obj.get_total_sui(layout_resolver).map_err(|e| {
+                    make_invariant_violation!(
+                        "Failed looking up input SUI in SUI conservation checking for input with \
+                         type {:?}: {e:#?}",
+                        obj.struct_tag(),
                     )
                 })?
             } else {
@@ -1249,26 +1314,25 @@ impl<S: GetModule + ObjectStore + BackingPackageStore> TemporaryStore<S> {
         } else {
             // not in input objects, must be a dynamic field
             if self.protocol_config.gas_model_version() < 2 {
-                let obj = self
-                    .store
-                    .get_object(id)
-                    .map_err(|_e| {
-                        ExecutionError::invariant_violation(
-                            "Failed looking up input object in SUI conservation checking",
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        ExecutionError::invariant_violation(
-                            "Failed looking up input object in SUI conservation checking",
-                        )
-                    })?;
+                let Ok(Some(obj)) = self.store.get_object(id) else {
+                    invariant_violation!(
+                        "Failed looking up dynamic field {id} in SUI conservation checking"
+                    );
+                };
                 if obj.version() != expected_version {
-                    return Err(ExecutionError::invariant_violation(format!("Version mismatching when resolving dynamic field to check conservation--expected {}, got {}", expected_version, obj.version())));
+                    invariant_violation!(
+                        "Version mismatching when resolving dynamic field to check conservation--\
+                         expected {}, got {}",
+                        expected_version,
+                        obj.version(),
+                    );
                 }
                 let input_sui = if do_expensive_checks {
-                    obj.get_total_sui(&self).map_err(|_e| {
-                        ExecutionError::invariant_violation(
-                            "Failed looking up output SUI in SUI conservation checking",
+                    obj.get_total_sui(layout_resolver).map_err(|e| {
+                        make_invariant_violation!(
+                            "Failed looking up input SUI in SUI conservation checking for type \
+                             {:?}: {e:#?}",
+                            obj.struct_tag(),
                         )
                     })?
                 } else {
@@ -1276,23 +1340,17 @@ impl<S: GetModule + ObjectStore + BackingPackageStore> TemporaryStore<S> {
                 };
                 Ok((input_sui, obj.storage_rebate))
             } else {
-                let obj = self
-                    .store
-                    .get_object_by_key(id, expected_version)
-                    .map_err(|_e| {
-                        ExecutionError::invariant_violation(
-                            "Failed looking up input object in SUI conservation checking",
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        ExecutionError::invariant_violation(
-                            "Failed looking up input object in SUI conservation checking",
-                        )
-                    })?;
+                let Ok(Some(obj))= self.store.get_object_by_key(id, expected_version) else {
+                    invariant_violation!(
+                        "Failed looking up dynamic field {id} in SUI conservation checking"
+                    );
+                };
                 let input_sui = if do_expensive_checks {
-                    obj.get_total_sui(&self).map_err(|_e| {
-                        ExecutionError::invariant_violation(
-                            "Failed looking up output SUI in SUI conservation checking",
+                    obj.get_total_sui(layout_resolver).map_err(|e| {
+                        make_invariant_violation!(
+                            "Failed looking up input SUI in SUI conservation checking for type \
+                             {:?}: {e:#?}",
+                            obj.struct_tag(),
                         )
                     })?
                 } else {
@@ -1303,22 +1361,32 @@ impl<S: GetModule + ObjectStore + BackingPackageStore> TemporaryStore<S> {
         }
     }
 
-    /// Check that this transaction neither creates nor destroys SUI. This should hold for all txes except
-    /// the epoch change tx, which mints staking rewards equal to the gas fees burned in the previous epoch.
-    /// Specifically, this checks two key invariants about storage fees and storage rebate:
-    /// 1. all SUI in storage rebate fields of input objects should flow either to the transaction storage rebate, or the transaction non-refundable storage rebate
-    /// 2. all SUI charged for storage should flow into the storage rebate field of some output object
+    /// Check that this transaction neither creates nor destroys SUI. This should hold for all txes
+    /// except the epoch change tx, which mints staking rewards equal to the gas fees burned in the
+    /// previous epoch.  Specifically, this checks two key invariants about storage fees and storage
+    /// rebate:
+    ///
+    /// 1. all SUI in storage rebate fields of input objects should flow either to the transaction
+    ///    storage rebate, or the transaction non-refundable storage rebate
+    /// 2. all SUI charged for storage should flow into the storage rebate field of some output
+    ///    object
+    ///
     /// If `do_expensive_checks` is true, this will also check a third invariant:
-    /// 3. all SUI in input objects (including coins etc in the Move part of an object) should flow either to an output object, or be burned as part of computation fees or non-refundable storage rebate
-    /// This function is intended to be called *after* we have charged for gas + applied the storage rebate to the gas object,
-    /// but *before* we have updated object versions.
-    /// if `do_expensive_checks` is false, this function will only check conservation of object storage rea
-    /// `epoch_fees` and `epoch_rebates` are only set for advance epoch transactions.
-    /// The advance epoch transaction would mint `epoch_fees` amount of SUI, and burn
-    /// `epoch_rebates` amount of SUI. We need these information for conservation check.
+    ///
+    /// 3. all SUI in input objects (including coins etc in the Move part of an object) should flow
+    ///    either to an output object, or be burned as part of computation fees or non-refundable
+    ///    storage rebate
+    ///
+    /// This function is intended to be called *after* we have charged for gas + applied the storage
+    /// rebate to the gas object, but *before* we have updated object versions.  If
+    /// `do_expensive_checks` is false, this function will only check conservation of object storage
+    /// rea `epoch_fees` and `epoch_rebates` are only set for advance epoch transactions.  The
+    /// advance epoch transaction would mint `epoch_fees` amount of SUI, and burn `epoch_rebates`
+    /// amount of SUI. We need these information for conservation check.
     pub fn check_sui_conserved(
         &self,
         advance_epoch_gas_summary: Option<(u64, u64)>,
+        layout_resolver: &mut impl LayoutResolver,
         do_expensive_checks: bool,
     ) -> Result<(), ExecutionError> {
         // total amount of SUI in input objects, including both coins and storage rebates
@@ -1335,15 +1403,22 @@ impl<S: GetModule + ObjectStore + BackingPackageStore> TemporaryStore<S> {
                     // note: output_obj.version has not yet been increased by the tx, so output_obj.version
                     // is the object version at tx input
                     let input_version = output_obj.version();
-                    let (input_sui, input_storage_rebate) =
-                        self.get_input_sui(id, input_version, do_expensive_checks)?;
+                    let (input_sui, input_storage_rebate) = self.get_input_sui(
+                        id,
+                        input_version,
+                        layout_resolver,
+                        do_expensive_checks,
+                    )?;
                     total_input_sui += input_sui;
                     if do_expensive_checks {
-                        total_output_sui += output_obj.get_total_sui(&self).map_err(|_e| {
-                            ExecutionError::invariant_violation(
-                                "Failed looking up output SUI in SUI conservation checking",
-                            )
-                        })?;
+                        total_output_sui +=
+                            output_obj.get_total_sui(layout_resolver).map_err(|e| {
+                                make_invariant_violation!(
+                                    "Failed looking up output SUI in SUI conservation checking for \
+                                     mutated type {:?}: {e:#?}",
+                                    output_obj.struct_tag(),
+                                )
+                            })?;
                     }
                     total_input_rebate += input_storage_rebate;
                     total_output_rebate += output_obj.storage_rebate;
@@ -1351,11 +1426,14 @@ impl<S: GetModule + ObjectStore + BackingPackageStore> TemporaryStore<S> {
                 WriteKind::Create => {
                     // created objects did not exist at input, and thus contribute 0 to input SUI
                     if do_expensive_checks {
-                        total_output_sui += output_obj.get_total_sui(&self).map_err(|_e| {
-                            ExecutionError::invariant_violation(
-                                "Failed looking up output SUI in SUI conservation checking",
-                            )
-                        })?;
+                        total_output_sui +=
+                            output_obj.get_total_sui(layout_resolver).map_err(|e| {
+                                make_invariant_violation!(
+                                    "Failed looking up output SUI in SUI conservation checking for \
+                                     created type {:?}: {e:#?}",
+                                    output_obj.struct_tag()
+                                )
+                            })?;
                     }
                     total_output_rebate += output_obj.storage_rebate;
                 }
@@ -1365,36 +1443,48 @@ impl<S: GetModule + ObjectStore + BackingPackageStore> TemporaryStore<S> {
                     // 2. wrapped in a dynamic field A, or itself a dynamic field
                     // in both cases, its contribution to input SUI will be captured by looking at A
                     if do_expensive_checks {
-                        total_output_sui += output_obj.get_total_sui(&self).map_err(|_e| {
-                            ExecutionError::invariant_violation(
-                                "Failed looking up output SUI in SUI conservation checking",
-                            )
-                        })?;
+                        total_output_sui +=
+                            output_obj.get_total_sui(layout_resolver).map_err(|e| {
+                                make_invariant_violation!(
+                                    "Failed looking up output SUI in SUI conservation checking for \
+                                     unwrapped type {:?}: {e:#?}",
+                                    output_obj.struct_tag(),
+                                )
+                            })?;
                     }
                     total_output_rebate += output_obj.storage_rebate;
                 }
             }
         }
-        for (id, (input_version, kind)) in &self.deleted {
+        for (id, kind) in &self.deleted {
             match kind {
-                DeleteKind::Normal => {
-                    let (input_sui, input_storage_rebate) =
-                        self.get_input_sui(id, *input_version, do_expensive_checks)?;
+                DeleteKindWithOldVersion::Normal(input_version) => {
+                    let (input_sui, input_storage_rebate) = self.get_input_sui(
+                        id,
+                        *input_version,
+                        layout_resolver,
+                        do_expensive_checks,
+                    )?;
                     total_input_sui += input_sui;
                     total_input_rebate += input_storage_rebate;
                 }
-                DeleteKind::Wrap => {
+                DeleteKindWithOldVersion::Wrap(input_version) => {
                     // wrapped object was a tx input or dynamic field--need to account for it in input SUI
                     // note: if an object is created by the tx, then wrapped, it will not appear here
-                    let (input_sui, input_storage_rebate) =
-                        self.get_input_sui(id, *input_version, do_expensive_checks)?;
+                    let (input_sui, input_storage_rebate) = self.get_input_sui(
+                        id,
+                        *input_version,
+                        layout_resolver,
+                        do_expensive_checks,
+                    )?;
                     total_input_sui += input_sui;
                     total_input_rebate += input_storage_rebate;
                     // else, the wrapped object was either:
                     // 1. freshly created, which means it has 0 contribution to input SUI
                     // 2. unwrapped from another object A, which means its contribution to input SUI will be captured by looking at A
                 }
-                DeleteKind::UnwrapThenDelete => {
+                DeleteKindWithOldVersion::UnwrapThenDelete
+                | DeleteKindWithOldVersion::UnwrapThenDeleteDEPRECATED(_) => {
                     // an unwrapped option was wrapped in input object or dynamic field A, which means its contribution to input SUI will
                     // be captured by looking at A
                 }
@@ -1452,20 +1542,26 @@ impl<S: GetModule + ObjectStore + BackingPackageStore> TemporaryStore<S> {
     }
 }
 
-impl<S: ChildObjectResolver> ChildObjectResolver for TemporaryStore<S> {
-    fn read_child_object(&self, parent: &ObjectID, child: &ObjectID) -> SuiResult<Option<Object>> {
+impl<'backing> ChildObjectResolver for TemporaryStore<'backing> {
+    fn read_child_object(
+        &self,
+        parent: &ObjectID,
+        child: &ObjectID,
+        child_version_upper_bound: SequenceNumber,
+    ) -> SuiResult<Option<Object>> {
         // there should be no read after delete
         debug_assert!(self.deleted.get(child).is_none());
         let obj_opt = self.written.get(child).map(|(obj, _kind)| obj);
         if obj_opt.is_some() {
             Ok(obj_opt.cloned())
         } else {
-            self.store.read_child_object(parent, child)
+            self.store
+                .read_child_object(parent, child, child_version_upper_bound)
         }
     }
 }
 
-impl<S: ChildObjectResolver> Storage for TemporaryStore<S> {
+impl<'backing> Storage for TemporaryStore<'backing> {
     fn reset(&mut self) {
         self.written.clear();
         self.deleted.clear();
@@ -1492,18 +1588,24 @@ impl<S: ChildObjectResolver> Storage for TemporaryStore<S> {
     }
 }
 
-impl<S: BackingPackageStore> BackingPackageStore for TemporaryStore<S> {
+impl<'backing> BackingPackageStore for TemporaryStore<'backing> {
     fn get_package_object(&self, package_id: &ObjectID) -> SuiResult<Option<Object>> {
-        self.store.get_package_object(package_id)
+        if let Some((obj, _)) = self.written.get(package_id) {
+            Ok(Some(obj.clone()))
+        } else {
+            self.store.get_package_object(package_id).map(|obj| {
+                // Track object but leave unchanged
+                if let Some(v) = obj.clone() {
+                    // Can this lock ever block execution?
+                    self.runtime_read_objects.write().insert(*package_id, v);
+                }
+                obj
+            })
+        }
     }
 }
 
-/// TODO: Proper implementation of re-linking (currently the default implementation does nothing).
-impl<S> LinkageResolver for TemporaryStore<S> {
-    type Error = SuiError;
-}
-
-impl<S: BackingPackageStore> ModuleResolver for TemporaryStore<S> {
+impl<'backing> ModuleResolver for TemporaryStore<'backing> {
     type Error = SuiError;
     fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
         let package_id = &ObjectID::from(*module_id.address());
@@ -1532,7 +1634,7 @@ impl<S: BackingPackageStore> ModuleResolver for TemporaryStore<S> {
     }
 }
 
-impl<S> ResourceResolver for TemporaryStore<S> {
+impl<'backing> ResourceResolver for TemporaryStore<'backing> {
     type Error = SuiError;
 
     fn get_resource(
@@ -1570,13 +1672,13 @@ impl<S> ResourceResolver for TemporaryStore<S> {
     }
 }
 
-impl<S: ParentSync> ParentSync for TemporaryStore<S> {
+impl<'backing> ParentSync for TemporaryStore<'backing> {
     fn get_latest_parent_entry_ref(&self, object_id: ObjectID) -> SuiResult<Option<ObjectRef>> {
         self.store.get_latest_parent_entry_ref(object_id)
     }
 }
 
-impl<S: GetModule<Error = SuiError, Item = CompiledModule>> GetModule for TemporaryStore<S> {
+impl<'backing> GetModule for TemporaryStore<'backing> {
     type Error = SuiError;
     type Item = CompiledModule;
 
@@ -1597,26 +1699,4 @@ impl<S: GetModule<Error = SuiError, Item = CompiledModule>> GetModule for Tempor
             self.store.get_module_by_id(module_id)
         }
     }
-}
-
-/// Create an empty `TemporaryStore` with no backing storage for module resolution.
-/// For testing purposes only.
-pub fn empty_for_testing() -> TemporaryStore<()> {
-    TemporaryStore::new(
-        (),
-        InputObjects::new(Vec::new()),
-        TransactionDigest::genesis(),
-        &ProtocolConfig::get_for_min_version(),
-    )
-}
-
-/// Create a `TemporaryStore` with the given inputs and no backing storage for module resolution.
-/// For testing purposes only.
-pub fn with_input_objects_for_testing(input_objects: InputObjects) -> TemporaryStore<()> {
-    TemporaryStore::new(
-        (),
-        input_objects,
-        TransactionDigest::genesis(),
-        &ProtocolConfig::get_for_min_version(),
-    )
 }

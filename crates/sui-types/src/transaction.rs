@@ -10,14 +10,16 @@ use crate::crypto::{
     ToFromBytes,
 };
 use crate::digests::{CertificateDigest, SenderSignedDataDigest};
-use crate::message_envelope::{Envelope, Message, TrustedEnvelope, VerifiedEnvelope};
+use crate::message_envelope::{
+    get_google_jwk_bytes, Envelope, Message, TrustedEnvelope, VerifiedEnvelope,
+};
 use crate::messages_checkpoint::CheckpointTimestamp;
 use crate::messages_consensus::ConsensusCommitPrologue;
 use crate::object::{MoveObject, Object, Owner};
 use crate::programmable_transaction_builder::ProgrammableTransactionBuilder;
-use crate::signature::{AuthenticatorTrait, GenericSignature};
+use crate::signature::{AuthenticatorTrait, AuxVerifyData, GenericSignature};
 use crate::{
-    SUI_CLOCK_OBJECT_ID, SUI_CLOCK_OBJECT_SHARED_VERSION, SUI_FRAMEWORK_OBJECT_ID,
+    SUI_CLOCK_OBJECT_ID, SUI_CLOCK_OBJECT_SHARED_VERSION, SUI_FRAMEWORK_PACKAGE_ID,
     SUI_SYSTEM_STATE_OBJECT_ID, SUI_SYSTEM_STATE_OBJECT_SHARED_VERSION,
 };
 use enum_dispatch::enum_dispatch;
@@ -40,6 +42,8 @@ use sui_protocol_config::{ProtocolConfig, SupportedProtocolVersions};
 use tap::Pipe;
 use tracing::trace;
 
+// TODO: The following constants appear to be very large.
+// We should revisit them.
 pub const TEST_ONLY_GAS_UNIT_FOR_TRANSFER: u64 = 2_000_000;
 pub const TEST_ONLY_GAS_UNIT_FOR_OBJECT_BASICS: u64 = 10_000_000;
 pub const TEST_ONLY_GAS_UNIT_FOR_PUBLISH: u64 = 25_000_000;
@@ -50,9 +54,12 @@ pub const TEST_ONLY_GAS_UNIT_FOR_SPLIT_COIN: u64 = 1_000_000;
 
 pub const GAS_PRICE_FOR_SYSTEM_TX: u64 = 1;
 
+pub const DEFAULT_VALIDATOR_GAS_PRICE: u64 = 1000;
+
 const BLOCKED_MOVE_FUNCTIONS: [(ObjectID, &str, &str); 0] = [];
 
 #[cfg(test)]
+#[cfg(feature = "test-utils")]
 #[path = "unit_tests/messages_tests.rs"]
 mod messages_tests;
 
@@ -62,6 +69,20 @@ pub enum CallArg {
     Pure(Vec<u8>),
     // an object
     Object(ObjectArg),
+}
+
+impl CallArg {
+    pub const SUI_SYSTEM_MUT: Self = Self::Object(ObjectArg::SUI_SYSTEM_MUT);
+    pub const CLOCK_IMM: Self = Self::Object(ObjectArg::SharedObject {
+        id: SUI_CLOCK_OBJECT_ID,
+        initial_shared_version: SUI_CLOCK_OBJECT_SHARED_VERSION,
+        mutable: false,
+    });
+    pub const CLOCK_MUT: Self = Self::Object(ObjectArg::SharedObject {
+        id: SUI_CLOCK_OBJECT_ID,
+        initial_shared_version: SUI_CLOCK_OBJECT_SHARED_VERSION,
+        mutable: true,
+    });
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
@@ -294,6 +315,12 @@ impl From<ObjectRef> for CallArg {
 }
 
 impl ObjectArg {
+    pub const SUI_SYSTEM_MUT: Self = Self::SharedObject {
+        id: SUI_SYSTEM_STATE_OBJECT_ID,
+        initial_shared_version: SUI_SYSTEM_STATE_OBJECT_SHARED_VERSION,
+        mutable: true,
+    };
+
     pub fn id(&self) -> ObjectID {
         match self {
             ObjectArg::ImmOrOwnedObject((id, _, _)) | ObjectArg::SharedObject { id, .. } => *id,
@@ -765,6 +792,12 @@ pub struct SharedInputObject {
 }
 
 impl SharedInputObject {
+    pub const SUI_SYSTEM_OBJ: Self = Self {
+        id: SUI_SYSTEM_STATE_OBJECT_ID,
+        initial_shared_version: SUI_SYSTEM_STATE_OBJECT_SHARED_VERSION,
+        mutable: true,
+    };
+
     pub fn id(&self) -> ObjectID {
         self.id
     }
@@ -810,11 +843,9 @@ impl TransactionKind {
     /// It covers both Call and ChangeEpoch transaction kind, because both makes Move calls.
     pub fn shared_input_objects(&self) -> impl Iterator<Item = SharedInputObject> + '_ {
         match &self {
-            Self::ChangeEpoch(_) => Either::Left(Either::Left(iter::once(SharedInputObject {
-                id: SUI_SYSTEM_STATE_OBJECT_ID,
-                initial_shared_version: SUI_SYSTEM_STATE_OBJECT_SHARED_VERSION,
-                mutable: true,
-            }))),
+            Self::ChangeEpoch(_) => {
+                Either::Left(Either::Left(iter::once(SharedInputObject::SUI_SYSTEM_OBJ)))
+            }
 
             Self::ConsensusCommitPrologue(_) => {
                 Either::Left(Either::Right(iter::once(SharedInputObject {
@@ -1304,7 +1335,7 @@ impl TransactionData {
             let upgrade_arg = builder.pure(upgrade_policy).unwrap();
             let digest_arg = builder.pure(digest).unwrap();
             let upgrade_ticket = builder.programmable_move_call(
-                SUI_FRAMEWORK_OBJECT_ID,
+                SUI_FRAMEWORK_PACKAGE_ID,
                 ident_str!("package").to_owned(),
                 ident_str!("authorize_upgrade").to_owned(),
                 vec![],
@@ -1313,7 +1344,7 @@ impl TransactionData {
             let upgrade_receipt = builder.upgrade(package_id, upgrade_ticket, dep_ids, modules);
 
             builder.programmable_move_call(
-                SUI_FRAMEWORK_OBJECT_ID,
+                SUI_FRAMEWORK_PACKAGE_ID,
                 ident_str!("package").to_owned(),
                 ident_str!("commit_upgrade").to_owned(),
                 vec![],
@@ -1654,6 +1685,10 @@ impl SenderSignedData {
         &self.inner().tx_signatures
     }
 
+    pub fn has_zklogin_sig(&self) -> bool {
+        self.tx_signatures().iter().any(|sig| sig.is_zklogin())
+    }
+
     #[cfg(test)]
     pub fn intent_message_mut_for_testing(&mut self) -> &mut IntentMessage<TransactionData> {
         &mut self.inner_mut().intent_message
@@ -1689,10 +1724,12 @@ impl VersionedProtocolMessage for SenderSignedData {
         // SuiError::WrongMessageVersion
         for sig in &self.inner().tx_signatures {
             match sig {
-                GenericSignature::MultiSig(_) | GenericSignature::Signature(_) => (),
+                GenericSignature::MultiSig(_)
+                | GenericSignature::Signature(_)
+                | GenericSignature::MultiSigLegacy(_)
+                | GenericSignature::ZkLoginAuthenticator(_) => (),
             }
         }
-
         Ok(())
     }
 }
@@ -1705,7 +1742,7 @@ impl Message for SenderSignedData {
         TransactionDigest::new(default_hash(&self.intent_message().value))
     }
 
-    fn verify(&self, _sig_epoch: Option<EpochId>) -> SuiResult {
+    fn verify(&self, sig_epoch: Option<EpochId>) -> SuiResult {
         fp_ensure!(
             self.0.len() == 1,
             SuiError::UserInputError {
@@ -1740,7 +1777,14 @@ impl Message for SenderSignedData {
 
         // Verify all present signatures.
         for (signer, signature) in present_sigs {
-            signature.verify_secure_generic(self.intent_message(), signer)?;
+            signature.verify_secure_generic(
+                self.intent_message(),
+                signer,
+                AuxVerifyData::new(
+                    sig_epoch,
+                    Some(get_google_jwk_bytes().read().unwrap().clone()),
+                ),
+            )?;
         }
         Ok(())
     }
@@ -1928,6 +1972,10 @@ impl CertifiedTransaction {
         bcs::serialize_into(&mut digest, self).expect("serialization should not fail");
         let hash = digest.finalize();
         CertificateDigest::new(hash.into())
+    }
+
+    pub fn gas_price(&self) -> u64 {
+        self.data().transaction_data().gas_price()
     }
 }
 

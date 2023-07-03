@@ -148,4 +148,8 @@ pub trait ReadApi {
         /// An optional protocol version specifier. If omitted, the latest protocol config table for the node will be returned.
         version: Option<BigInt<u64>>,
     ) -> RpcResult<ProtocolConfigResponse>;
+
+    /// Return the first four bytes of the chain's genesis checkpoint digest.
+    #[method(name = "getChainIdentifier")]
+    async fn get_chain_identifier(&self) -> RpcResult<String>;
 }

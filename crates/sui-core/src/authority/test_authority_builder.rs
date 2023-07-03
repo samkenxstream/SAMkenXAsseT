@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
+use crate::authority::authority_store_tables::AuthorityPerpetualTables;
 use crate::authority::epoch_start_configuration::EpochStartConfiguration;
 use crate::authority::{AuthorityState, AuthorityStore};
 use crate::checkpoints::CheckpointStore;
@@ -13,23 +14,27 @@ use fastcrypto::traits::KeyPair;
 use prometheus::Registry;
 use std::path::PathBuf;
 use std::sync::Arc;
+use sui_archival::reader::ArchiveReaderBalancer;
 use sui_config::certificate_deny_config::CertificateDenyConfig;
 use sui_config::genesis::Genesis;
+use sui_config::node::StateDebugDumpConfig;
 use sui_config::node::{
     AuthorityStorePruningConfig, DBCheckpointConfig, ExpensiveSafetyCheckConfig,
 };
 use sui_config::transaction_deny_config::TransactionDenyConfig;
-use sui_config::NetworkConfig;
 use sui_macros::nondeterministic;
 use sui_protocol_config::{ProtocolConfig, SupportedProtocolVersions};
 use sui_storage::IndexStore;
+use sui_swarm_config::network_config::NetworkConfig;
 use sui_types::base_types::{AuthorityName, ObjectID};
 use sui_types::crypto::AuthorityKeyPair;
+use sui_types::digests::ChainIdentifier;
 use sui_types::error::SuiResult;
 use sui_types::executable_transaction::VerifiedExecutableTransaction;
 use sui_types::object::Object;
 use sui_types::sui_system_state::SuiSystemStateTrait;
 use sui_types::transaction::VerifiedTransaction;
+use tempfile::tempdir;
 
 #[derive(Default)]
 pub struct TestAuthorityBuilder<'a> {
@@ -42,6 +47,7 @@ pub struct TestAuthorityBuilder<'a> {
     node_keypair: Option<&'a AuthorityKeyPair>,
     genesis: Option<&'a Genesis>,
     starting_objects: Option<&'a [Object]>,
+    expensive_safety_checks: Option<ExpensiveSafetyCheckConfig>,
 }
 
 impl<'a> TestAuthorityBuilder<'a> {
@@ -113,6 +119,11 @@ impl<'a> TestAuthorityBuilder<'a> {
         )
     }
 
+    pub fn with_expensive_safety_checks(mut self, config: ExpensiveSafetyCheckConfig) -> Self {
+        assert!(self.expensive_safety_checks.replace(config).is_none());
+        self
+    }
+
     pub async fn side_load_objects(
         authority_state: Arc<AuthorityState>,
         objects: &'a [Object],
@@ -124,10 +135,10 @@ impl<'a> TestAuthorityBuilder<'a> {
     }
 
     pub async fn build(self) -> Arc<AuthorityState> {
-        let local_network_config = sui_config::builder::ConfigBuilder::new_with_temp_dir()
-            // TODO: change the default to 1000 instead after fixing tests.
-            .with_reference_gas_price(self.reference_gas_price.unwrap_or(1))
-            .build();
+        let local_network_config =
+            sui_swarm_config::network_config_builder::ConfigBuilder::new_with_temp_dir()
+                .with_reference_gas_price(self.reference_gas_price.unwrap_or(500))
+                .build();
         let genesis = &self.genesis.unwrap_or(&local_network_config.genesis);
         let genesis_committee = genesis.committee().unwrap();
         let path = self.store_base_path.unwrap_or_else(|| {
@@ -140,10 +151,11 @@ impl<'a> TestAuthorityBuilder<'a> {
         let authority_store = match self.store {
             Some(store) => store,
             None => {
+                let perpetual_tables =
+                    Arc::new(AuthorityPerpetualTables::open(&path.join("store"), None));
                 // unwrap ok - for testing only.
                 AuthorityStore::open_with_committee_for_testing(
-                    &path.join("store"),
-                    None,
+                    perpetual_tables,
                     &genesis_committee,
                     genesis,
                     0,
@@ -160,14 +172,19 @@ impl<'a> TestAuthorityBuilder<'a> {
         let registry = Registry::new();
         let cache_metrics = Arc::new(ResolverMetrics::new(&registry));
         let signature_verifier_metrics = SignatureVerifierMetrics::new(&registry);
-        if self.protocol_config.is_some() {
-            let config = self.protocol_config.unwrap();
-            let _guard = ProtocolConfig::apply_overrides_for_testing(move |_, _| config.clone());
-        }
+        // `_guard` must be declared here so it is not dropped before
+        // `AuthorityPerEpochStore::new` is called
+        let _guard = self
+            .protocol_config
+            .map(|config| ProtocolConfig::apply_overrides_for_testing(move |_, _| config.clone()));
         let epoch_start_configuration = EpochStartConfiguration::new(
             genesis.sui_system_object().into_epoch_start_state(),
             *genesis.checkpoint().digest(),
         );
+        let expensive_safety_checks = match self.expensive_safety_checks {
+            None => ExpensiveSafetyCheckConfig::default(),
+            Some(config) => config,
+        };
         let epoch_store = AuthorityPerEpochStore::new(
             name,
             Arc::new(genesis_committee.clone()),
@@ -178,9 +195,9 @@ impl<'a> TestAuthorityBuilder<'a> {
             authority_store.clone(),
             cache_metrics,
             signature_verifier_metrics,
-            &ExpensiveSafetyCheckConfig::default(),
+            &expensive_safety_checks,
+            ChainIdentifier::from(*genesis.checkpoint().digest()),
         );
-
         let committee_store = Arc::new(CommitteeStore::new(
             path.join("epochs"),
             &genesis_committee,
@@ -214,6 +231,10 @@ impl<'a> TestAuthorityBuilder<'a> {
             transaction_deny_config,
             certificate_deny_config,
             usize::MAX,
+            StateDebugDumpConfig {
+                dump_file_directory: Some(tempdir().unwrap().into_path()),
+            },
+            ArchiveReaderBalancer::default(),
         )
         .await;
         // For any type of local testing that does not actually spawn a node, the checkpoint executor

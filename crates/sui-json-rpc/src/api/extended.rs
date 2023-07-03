@@ -5,8 +5,8 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee_proc_macros::rpc;
 
 use sui_json_rpc_types::{
-    CheckpointedObjectID, EpochInfo, EpochPage, MoveCallMetrics, NetworkMetrics, QueryObjectsPage,
-    SuiObjectResponseQuery,
+    AddressMetrics, CheckpointedObjectID, EpochInfo, EpochPage, MoveCallMetrics, NetworkMetrics,
+    QueryObjectsPage, SuiObjectResponseQuery,
 };
 use sui_open_rpc_macros::open_rpc;
 use sui_types::sui_serde::BigInt;
@@ -49,4 +49,15 @@ pub trait ExtendedApi {
     /// Return Network metrics
     #[method(name = "getMoveCallMetrics")]
     async fn get_move_call_metrics(&self) -> RpcResult<MoveCallMetrics>;
+
+    /// Address related metrics
+    #[method(name = "getLatestAddressMetrics")]
+    async fn get_latest_address_metrics(&self) -> RpcResult<AddressMetrics>;
+    #[method(name = "getCheckpointAddressMetrics")]
+    async fn get_checkpoint_address_metrics(&self, checkpoint: u64) -> RpcResult<AddressMetrics>;
+    #[method(name = "getAllEpochAddressMetrics")]
+    async fn get_all_epoch_address_metrics(
+        &self,
+        descending_order: Option<bool>,
+    ) -> RpcResult<Vec<AddressMetrics>>;
 }

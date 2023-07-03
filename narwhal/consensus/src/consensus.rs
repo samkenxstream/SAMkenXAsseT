@@ -4,11 +4,17 @@
 
 #![allow(clippy::mutable_key_type)]
 
+use crate::bullshark::Bullshark;
 use crate::utils::gc_round;
-use crate::{metrics::ConsensusMetrics, ConsensusError, Outcome, SequenceNumber};
+use crate::{metrics::ConsensusMetrics, ConsensusError, SequenceNumber};
 use config::{AuthorityIdentifier, Committee};
 use fastcrypto::hash::Hash;
+use mysten_metrics::metered_channel;
 use mysten_metrics::spawn_logged_monitored_task;
+use rand::prelude::SliceRandom;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use std::collections::HashSet;
 use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -16,10 +22,10 @@ use std::{
 };
 use storage::{CertificateStore, ConsensusStore};
 use tokio::{sync::watch, task::JoinHandle};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, trace};
 use types::{
-    metered_channel, Certificate, CertificateAPI, CertificateDigest, CommittedSubDag,
-    ConditionalBroadcastReceiver, ConsensusCommit, HeaderAPI, Round, Timestamp,
+    Certificate, CertificateAPI, CertificateDigest, CommittedSubDag, ConditionalBroadcastReceiver,
+    ConsensusCommit, HeaderAPI, ReputationScores, Round, Timestamp,
 };
 
 #[cfg(test)]
@@ -28,6 +34,113 @@ pub mod consensus_tests;
 
 /// The representation of the DAG in memory.
 pub type Dag = BTreeMap<Round, HashMap<AuthorityIdentifier, (CertificateDigest, Certificate)>>;
+
+#[derive(Default)]
+pub struct LeaderSwapTable {
+    /// The round on which the leader swap table get into effect.
+    _round: Round,
+    /// The list of `f` (by stake) authorities with best scores as those defined by the provided `ReputationScores`.
+    /// Those authorities will be used in the position of the `bad_nodes` on the final leader schedule.
+    good_nodes: Vec<AuthorityIdentifier>,
+    /// The set of `f` (by stake) authorities with the worst scores as those defined by the provided `ReputationScores`.
+    /// Every time where such authority is elected as leader on the schedule, it will swapped by one
+    /// of the authorities of the `good_nodes`.
+    bad_nodes: HashSet<AuthorityIdentifier>,
+}
+
+impl LeaderSwapTable {
+    // constructs a new table based on the provided reputation scores.
+    pub fn new(committee: &Committee, round: Round, reputation_scores: ReputationScores) -> Self {
+        assert!(reputation_scores.final_of_schedule, "Only reputation scores that have been calculated on the end of a schedule are accepted");
+
+        // calculating the good nodes
+        let good_nodes = Self::retrieve_first_nodes(
+            committee,
+            reputation_scores.authorities_by_score_desc().into_iter(),
+        );
+
+        // calculating the bad nodes
+        // we revert the sorted authorities to score ascending so we get the first f low scorers
+        let bad_nodes = Self::retrieve_first_nodes(
+            committee,
+            reputation_scores
+                .authorities_by_score_desc()
+                .into_iter()
+                .rev(),
+        )
+        .into_iter()
+        .collect::<HashSet<AuthorityIdentifier>>();
+
+        debug!("Reputation scores on round {round}: {reputation_scores:?}");
+        debug!("Good nodes: {good_nodes:?}");
+        debug!("Bad nodes: {bad_nodes:?}");
+
+        Self {
+            _round: round,
+            good_nodes,
+            bad_nodes,
+        }
+    }
+
+    /// Checks whether the provided leader is a bad performer and needs to be swapped in the schedule
+    /// with a good performer. If not, then the method returns None. Otherwise the leader to swap with
+    /// is returned instead. The `leader_round` represents the DAG round on which the provided AuthorityIdentifier
+    /// is a leader on and is used as a seed to random function in order to calculate the good node that
+    /// will swap in that round with the bad node. We are intentionally not doing weighted randomness as
+    /// we want to give to all the good nodes equal opportunity to get swapped with bad nodes and not
+    /// have one node with enough stake end up swapping bad nodes more frequently than the others on
+    /// the final schedule.
+    pub fn swap(
+        &self,
+        leader: &AuthorityIdentifier,
+        leader_round: Round,
+    ) -> Option<AuthorityIdentifier> {
+        if self.bad_nodes.contains(leader) {
+            let mut seed_bytes = [0u8; 32];
+            seed_bytes[32 - 8..].copy_from_slice(&leader_round.to_le_bytes());
+            let mut rng = StdRng::from_seed(seed_bytes);
+
+            let good_node = self
+                .good_nodes
+                .choose(&mut rng)
+                .expect("There should be at least one good node available");
+
+            trace!(
+                "Swapping bad leader {} -> {} for round {}",
+                leader,
+                good_node,
+                leader_round
+            );
+
+            return Some(*good_node);
+        }
+        None
+    }
+
+    // Retrieves the first f by stake nodes provided by the iterator `authorities`. It's the
+    // caller's responsibility to ensure that the elements of the `authorities` input is already
+    // sorted.
+    fn retrieve_first_nodes(
+        committee: &Committee,
+        authorities: impl Iterator<Item = (AuthorityIdentifier, u64)>,
+    ) -> Vec<AuthorityIdentifier> {
+        let mut filtered_authorities = Vec::new();
+
+        let mut stake = 0;
+        for (authority_id, _score) in authorities {
+            stake += committee.stake_by_id(authority_id);
+
+            // if by adding the authority we have reached validity, then we exit so we make sure that
+            // we gather < f + 1
+            if committee.reached_validity(stake) {
+                break;
+            }
+            filtered_authorities.push(authority_id);
+        }
+
+        filtered_authorities
+    }
+}
 
 /// The state that needs to be persisted for crash-recovery.
 pub struct ConsensusState {
@@ -40,6 +153,9 @@ pub struct ConsensusState {
     pub last_committed: HashMap<AuthorityIdentifier, Round>,
     /// The last committed sub dag. If value is None, it means that we haven't committed any sub dag yet.
     pub last_committed_sub_dag: Option<CommittedSubDag>,
+    /// Holds the set of good and bad nodes - as per the last calculated reputation scores - and
+    /// performs a necessary swap to ensure that only good leaders will be elected
+    pub leader_swap_table: LeaderSwapTable,
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything older
     /// must be regularly cleaned up through the function `update`.
     pub dag: Dag,
@@ -53,6 +169,7 @@ impl ConsensusState {
             last_round: ConsensusRound::default(),
             gc_depth,
             last_committed: Default::default(),
+            leader_swap_table: Default::default(),
             dag: Default::default(),
             last_committed_sub_dag: None,
             metrics,
@@ -108,6 +225,7 @@ impl ConsensusState {
             last_round,
             last_committed: recovered_last_committed,
             last_committed_sub_dag,
+            leader_swap_table: Default::default(),
             dag,
             metrics,
         }
@@ -250,17 +368,6 @@ impl ConsensusState {
     }
 }
 
-/// Describe how to sequence input certificates.
-pub trait ConsensusProtocol {
-    fn process_certificate(
-        &mut self,
-        // The state of the consensus protocol.
-        state: &mut ConsensusState,
-        // The new certificate.
-        certificate: Certificate,
-    ) -> Result<(Outcome, Vec<CommittedSubDag>), ConsensusError>;
-}
-
 /// Holds information about a committed round in consensus. When a certificate gets committed then
 /// the corresponding certificate's round is considered a "committed" round. It bears both the
 /// committed round and the corresponding garbage collection round.
@@ -301,7 +408,7 @@ impl ConsensusRound {
     }
 }
 
-pub struct Consensus<ConsensusProtocol> {
+pub struct Consensus {
     /// The committee information.
     committee: Committee,
 
@@ -318,7 +425,7 @@ pub struct Consensus<ConsensusProtocol> {
     tx_sequence: metered_channel::Sender<CommittedSubDag>,
 
     /// The consensus protocol to run.
-    protocol: ConsensusProtocol,
+    protocol: Bullshark,
 
     /// Metrics handler
     metrics: Arc<ConsensusMetrics>,
@@ -327,10 +434,7 @@ pub struct Consensus<ConsensusProtocol> {
     state: ConsensusState,
 }
 
-impl<Protocol> Consensus<Protocol>
-where
-    Protocol: ConsensusProtocol + Send + 'static,
-{
+impl Consensus {
     #[must_use]
     pub fn spawn(
         committee: Committee,
@@ -342,7 +446,7 @@ where
         tx_committed_certificates: metered_channel::Sender<(Round, Vec<Certificate>)>,
         tx_consensus_round_updates: watch::Sender<ConsensusRound>,
         tx_sequence: metered_channel::Sender<CommittedSubDag>,
-        protocol: Protocol,
+        protocol: Bullshark,
         metrics: Arc<ConsensusMetrics>,
     ) -> JoinHandle<()> {
         // The consensus state (everything else is immutable).

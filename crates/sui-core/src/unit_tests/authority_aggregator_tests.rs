@@ -257,7 +257,7 @@ async fn execute_transaction_with_fault_configs(
     for (index, config) in configs_before_process_transaction {
         set_local_client_config(&mut authorities, *index, *config);
     }
-    let rgp = genesis.reference_gas_price();
+    let rgp = reference_gas_price(&authorities);
     let tx = make_transfer_object_transaction(
         gas_object1.compute_object_reference(),
         gas_object2.compute_object_reference(),
@@ -286,6 +286,20 @@ async fn execute_transaction_with_fault_configs(
         .process_certificate(cert.into_cert_for_testing().into())
         .await
         .is_ok()
+}
+
+fn reference_gas_price(authorities: &AuthorityAggregator<LocalAuthorityClient>) -> u64 {
+    authorities
+        .authority_clients
+        .values()
+        .find_map(|client| {
+            client
+                .authority_client()
+                .state
+                .reference_gas_price_for_testing()
+                .ok()
+        })
+        .unwrap()
 }
 
 fn effects_with_tx(digest: TransactionDigest) -> TransactionEffects {
@@ -320,7 +334,7 @@ async fn test_quorum_map_and_reduce_timeout() {
     let gas_object1 = Object::with_owner_for_testing(addr1);
     let genesis_objects = vec![pkg.clone(), gas_object1.clone()];
     let (mut authorities, _, genesis, _) = init_local_authorities(4, genesis_objects).await;
-    let rgp = genesis.reference_gas_price();
+    let rgp = reference_gas_price(&authorities);
     let pkg = genesis.object(pkg.id()).unwrap();
     let gas_object1 = genesis.object(gas_object1.id()).unwrap();
     let gas_ref_1 = gas_object1.compute_object_reference();
@@ -753,6 +767,7 @@ async fn test_handle_transaction_panic() {
 
 #[tokio::test]
 async fn test_handle_transaction_response() {
+    telemetry_subscribers::init_for_testing();
     let mut authorities = BTreeMap::new();
     let mut clients = BTreeMap::new();
     let mut authority_keys = Vec::new();
@@ -1846,6 +1861,89 @@ async fn test_handle_overload_response() {
         },
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_early_exit_with_too_many_conflicts() {
+    let mut authorities = BTreeMap::new();
+    let mut clients = BTreeMap::new();
+    let mut authority_keys = Vec::new();
+    for _ in 0..4 {
+        let (_, sec): (_, AuthorityKeyPair) = get_key_pair();
+        let name: AuthorityName = sec.public().into();
+        authorities.insert(name, 1);
+        authority_keys.push((name, sec));
+        clients.insert(name, HandleTransactionTestAuthorityClient::new());
+    }
+
+    let (sender, sender_kp): (_, AccountKeyPair) = get_key_pair();
+    let txn = make_transfer_sui_transaction(
+        random_object_ref(),
+        SuiAddress::default(),
+        None,
+        sender,
+        &sender_kp,
+        666, // this is a dummy value which does not matter
+    );
+
+    // Now we have 3 conflicting transactions each with 1 stake. There is no hope to get quorum for any of them.
+    // So we expect to exit early before getting the final response (from whom is still sleeping).
+    set_tx_info_response_with_error(
+        &mut clients,
+        authority_keys.iter().take(1),
+        SuiError::ObjectLockConflict {
+            obj_ref: random_object_ref(),
+            pending_transaction: TransactionDigest::random(),
+        },
+    );
+    set_tx_info_response_with_error(
+        &mut clients,
+        authority_keys.iter().skip(1).take(1),
+        SuiError::ObjectLockConflict {
+            obj_ref: random_object_ref(),
+            pending_transaction: TransactionDigest::random(),
+        },
+    );
+    set_tx_info_response_with_error(
+        &mut clients,
+        authority_keys.iter().skip(2).take(1),
+        SuiError::ObjectLockConflict {
+            obj_ref: random_object_ref(),
+            pending_transaction: TransactionDigest::random(),
+        },
+    );
+    set_tx_info_response_with_error(
+        &mut clients,
+        authority_keys.iter().skip(3).take(1),
+        SuiError::TooManyTransactionsPendingExecution {
+            queue_len: 100,
+            threshold: 100,
+        },
+    );
+    // Make one validator sleep for very long time
+    clients
+        .get_mut(&authority_keys.get(3).unwrap().0)
+        .unwrap()
+        .set_sleep_duration_before_responding(Duration::from_secs(60));
+
+    let agg = get_genesis_agg(authorities.clone(), clients.clone());
+    // Expect to exit early without waiting for the sleeping one.
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        assert_resp_err(
+            &agg,
+            txn.clone(),
+            |e| {
+                matches!(
+                    e,
+                    AggregatorProcessTransactionError::FatalConflictingTransaction { .. }
+                )
+            },
+            |_e| true,
+        ),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

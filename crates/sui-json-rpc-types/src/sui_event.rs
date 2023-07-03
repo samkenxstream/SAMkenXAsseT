@@ -72,6 +72,18 @@ impl From<EventEnvelope> for SuiEvent {
     }
 }
 
+impl From<SuiEvent> for Event {
+    fn from(val: SuiEvent) -> Self {
+        Event {
+            package_id: val.package_id,
+            transaction_module: val.transaction_module,
+            sender: val.sender,
+            type_: val.type_,
+            contents: val.bcs,
+        }
+    }
+}
+
 impl SuiEvent {
     pub fn try_from(
         event: Event,
@@ -136,6 +148,15 @@ pub enum EventFilter {
         #[serde_as(as = "SuiStructTag")]
         StructTag,
     ),
+    /// Return events with the given move event module name
+    MoveEventModule {
+        /// the Move package ID
+        package: ObjectID,
+        /// the module name
+        #[schemars(with = "String")]
+        #[serde_as(as = "DisplayFromStr")]
+        module: Identifier,
+    },
     MoveEventField {
         path: String,
         value: Value,
@@ -190,6 +211,9 @@ impl EventFilter {
                 } else {
                     false
                 }
+            }
+            EventFilter::MoveEventModule { package, module } => {
+                &item.type_.module == module && &ObjectID::from(item.type_.address) == package
             }
         })
     }
